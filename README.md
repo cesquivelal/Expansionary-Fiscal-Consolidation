@@ -2,7 +2,7 @@
 
 Replication code for "Expansionary Fiscal Consolidation Under Sovereign Risk" by Carlos Esquivel and Agustín Sámano
 
-October, 2024:
+August, 2025:
 https://cesquivelal.github.io/ES_ExFisCon.pdf
 
 # Data
@@ -19,7 +19,5 @@ The code is written in the Julia language, version 1.7.2 and uses the following 
 The file Primitives.jl defines all objects and functions that are used to solve and simulate the model.
 
 The file mainAll.jl in the folder Model uses the file Primitives.jl to solve for the benchmark model with no fiscal rule for the model with different debt limits, and for the model with the optimal debt limit and different deficit limits. All solutions are stored in separate .csv files. The file Setup.csv defines the main parameters.
-
-The file grim.jl solves for the model with the optimal fiscal rule with debt and deficit limits assuming no commitment to the rule.
 
 The file ResultsForPaper.jl uses the solutions to produce all the model results reported in Section 3 of the paper.
