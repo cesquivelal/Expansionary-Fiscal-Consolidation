@@ -15,6 +15,8 @@ using Parameters, Interpolations, Optim, SharedArrays, DelimitedFiles,
     σ::Float64 = 2.0          #CRRA parameter
     β::Float64 = 0.98         #Discount factor consistent with annualized r=8.4%
     r_star::Float64 = 0.01    #Risk-fr  ee interest rate
+    βhh::Float64 = 0.98       #Household discount factor
+    PatientHH::Bool = false   #Is there relative myopia?
     #Debt parameters
     γ::Float64 = 0.05         #Reciprocal of average maturity
     κ::Float64 = 0.03         #Coupon payments
@@ -25,6 +27,9 @@ using Parameters, Interpolations, Optim, SharedArrays, DelimitedFiles,
     d0::Float64 = -0.18819#-0.2914       #income default cost
     d1::Float64 = 0.24558#0.4162        #income default cost
     #Production and capital accumulation
+    Decentralized::Bool = false  #Who makes the capita accumulation decision
+    Strict::Bool = false
+    ForeignInvestors::Bool = false
     α::Float64 = 0.33            #Capital share
     δ::Float64 = 0.05            #Capital depreciation rate
     φ::Float64 = 21.0             #Capital adjustment cost parameter
@@ -32,6 +37,7 @@ using Parameters, Interpolations, Optim, SharedArrays, DelimitedFiles,
     WithFR::Bool = false         #Define whether to apply fiscal rule
     FR::Float64 = 0.30           #Maximum b'/GDP
     χ::Float64 = 0.03               #Fiscal consolidation parameter
+    OnlyBudgetBalance::Bool = false
     #Stochastic process
     #parameters for productivity shock
     σ_ϵz::Float64 = 0.017
@@ -52,7 +58,7 @@ using Parameters, Interpolations, Optim, SharedArrays, DelimitedFiles,
     blow::Float64 = 0.0
     bhigh::Float64 = 4.0#15.0
     #Parameters for solution algorithm
-    cmin::Float64 = 1e-2
+    cmin::Float64 = 1e-3
     Tol_V::Float64 = 1e-6       #Tolerance for absolute distance for value functions
     Tol_q::Float64 = 1e-6       #Tolerance for absolute distance for q
     cnt_max::Int64 = 200           #Maximum number of iterations on VFI
@@ -153,6 +159,16 @@ end
     itp_kprime_D::T6
     itp_kprime::T7
     itp_bprime::T7
+
+    #Household value
+    VDhh::T1
+    VPhh::T2
+    EVDhh::T1
+    EVhh::T2
+    itp_VDhh::T3
+    itp_VPhh::T4
+    itp_EVDhh::T3
+    itp_EVhh::T4
 end
 
 @with_kw struct Model
@@ -173,6 +189,13 @@ end
     itp_dR_Rep::T4
     itp_ER_Def::T3
     itp_ER_Rep::T4
+end
+
+@with_kw mutable struct State
+    Default::Bool
+    z::Float64
+    k::Float64
+    b::Float64
 end
 
 ################################################################
@@ -279,7 +302,7 @@ function CreateInterpolation_HouseholdObjects(MAT::Array{Float64},IsDefault::Boo
 end
 
 ################################################################################
-### Functions to save solution in CSV
+### Functions to pack models in vectors and save to CSV
 ################################################################################
 function InitiateEmptySolution(GRIDS::Grids,par::Pars)
     @unpack Nz, Nk, Nb = par
@@ -310,14 +333,21 @@ function InitiateEmptySolution(GRIDS::Grids,par::Pars)
     itp_kprime_D=CreateInterpolation_Policies(kprime_D,true,GRIDS)
     itp_kprime=CreateInterpolation_Policies(kprime,false,GRIDS)
     itp_bprime=CreateInterpolation_Policies(bprime,false,GRIDS)
-    ### Interpolation objects
-    #Input values for end of time
-    return Solution(VD,VP,V,EVD,EV,q1,kprime_D,kprime,bprime,Tr,DEV_RULE,itp_VD,itp_VP,itp_V,itp_EVD,itp_EV,itp_q1,itp_kprime_D,itp_kprime,itp_bprime)
+    #Household value
+    VDhh=zeros(Float64,Nk,Nz)
+    VPhh=zeros(Float64,Nb,Nk,Nz)
+    EVDhh=zeros(Float64,Nk,Nz)
+    EVhh=zeros(Float64,Nb,Nk,Nz)
+    itp_VDhh=CreateInterpolation_ValueFunctions(VDhh,true,GRIDS)
+    itp_VPhh=CreateInterpolation_ValueFunctions(VPhh,false,GRIDS)
+    itp_EVDhh=CreateInterpolation_ValueFunctions(VDhh,true,GRIDS)
+    itp_EVhh=CreateInterpolation_ValueFunctions(VPhh,false,GRIDS)
+    return Solution(VD,VP,V,EVD,EV,q1,kprime_D,kprime,bprime,Tr,DEV_RULE,itp_VD,itp_VP,itp_V,itp_EVD,itp_EV,itp_q1,itp_kprime_D,itp_kprime,itp_bprime,VDhh,VPhh,EVDhh,EVhh,itp_VDhh,itp_VPhh,itp_EVDhh,itp_EVhh)
 end
 
 function StackSolution_Vector(SOLUTION::Solution)
     #Stack vectors of repayment first
-    @unpack VP, V, EV, q1 = SOLUTION
+    @unpack VP, V, EV, q1, VPhh, EVhh = SOLUTION
     @unpack kprime, bprime, Tr, DEV_RULE = SOLUTION
     VEC=reshape(VP,(:))
     VEC=vcat(VEC,reshape(V,(:)))
@@ -327,12 +357,16 @@ function StackSolution_Vector(SOLUTION::Solution)
     VEC=vcat(VEC,reshape(bprime,(:)))
     VEC=vcat(VEC,reshape(Tr,(:)))
     VEC=vcat(VEC,reshape(DEV_RULE,(:)))
+    VEC=vcat(VEC,reshape(VPhh,(:)))
+    VEC=vcat(VEC,reshape(EVhh,(:)))
 
     #Then stack vectors of default
-    @unpack VD, EVD, kprime_D = SOLUTION
+    @unpack VD, EVD, kprime_D, VDhh, EVDhh = SOLUTION
     VEC=vcat(VEC,reshape(VD,(:)))
     VEC=vcat(VEC,reshape(EVD,(:)))
     VEC=vcat(VEC,reshape(kprime_D,(:)))
+    VEC=vcat(VEC,reshape(VDhh,(:)))
+    VEC=vcat(VEC,reshape(EVDhh,(:)))
 
     return VEC
 end
@@ -376,10 +410,44 @@ function VectorOfRelevantParameters(par::Pars)
         VEC=vcat(VEC,0.0)         #18
     end
 
+    if par.Decentralized
+        VEC=vcat(VEC,1.0)         #19
+    else
+        VEC=vcat(VEC,0.0)         #19
+    end
+
+    if par.ForeignInvestors
+        VEC=vcat(VEC,1.0)         #20
+    else
+        VEC=vcat(VEC,0.0)         #20
+    end
+
+    if par.Strict
+        VEC=vcat(VEC,1.0)         #21
+    else
+        VEC=vcat(VEC,0.0)         #21
+    end
+
+    if par.PatientHH
+        VEC=vcat(VEC,1.0)         #22
+    else
+        VEC=vcat(VEC,0.0)         #22
+    end
+
+    VEC=vcat(VEC,par.γ)         #23
+
+    if par.OnlyBudgetBalance
+        VEC=vcat(VEC,1.0)         #24
+    else
+        VEC=vcat(VEC,0.0)         #24
+    end
+
+
     return VEC
 end
 
-function Create_Model_Vector(SOLUTION::Solution,par::Pars)
+function Create_Model_Vector(MODEL::Model)
+    @unpack SOLUTION, par = MODEL
     VEC_PAR=VectorOfRelevantParameters(par)
     N_parameters=length(VEC_PAR)
     VEC=vcat(N_parameters,VEC_PAR)
@@ -390,8 +458,8 @@ function Create_Model_Vector(SOLUTION::Solution,par::Pars)
     return vcat(VEC,VEC_SOL)
 end
 
-function SaveModel_Vector(NAME::String,SOLUTION::Solution,par::Pars)
-    VEC=Create_Model_Vector(SOLUTION,par)
+function SaveModel_Vector(NAME::String,MODEL::Model)
+    VEC=Create_Model_Vector(MODEL)
     writedlm(NAME,VEC,',')
     return nothing
 end
@@ -433,6 +501,10 @@ function TransformVectorToSolution(VEC::Array{Float64},GRIDS::Grids,par::Pars)
     Tr=ExtractMatrixFromSolutionVector(start,size_repayment,false,VEC,par)
     start=start+size_repayment
     DEV_RULE=ExtractMatrixFromSolutionVector(start,size_repayment,false,VEC,par)
+    start=start+size_repayment
+    VPhh=ExtractMatrixFromSolutionVector(start,size_repayment,false,VEC,par)
+    start=start+size_repayment
+    EVhh=ExtractMatrixFromSolutionVector(start,size_repayment,false,VEC,par)
 
     #Default
     start=start+size_repayment
@@ -441,6 +513,10 @@ function TransformVectorToSolution(VEC::Array{Float64},GRIDS::Grids,par::Pars)
     EVD=ExtractMatrixFromSolutionVector(start,size_default,true,VEC,par)
     start=start+size_default
     kprime_D=ExtractMatrixFromSolutionVector(start,size_default,true,VEC,par)
+    start=start+size_default
+    VDhh=ExtractMatrixFromSolutionVector(start,size_default,true,VEC,par)
+    start=start+size_default
+    EVDhh=ExtractMatrixFromSolutionVector(start,size_default,true,VEC,par)
     #Create interpolation objects
     itp_VD=CreateInterpolation_ValueFunctions(VD,true,GRIDS)
     itp_VP=CreateInterpolation_ValueFunctions(VP,false,GRIDS)
@@ -455,9 +531,14 @@ function TransformVectorToSolution(VEC::Array{Float64},GRIDS::Grids,par::Pars)
     itp_kprime=CreateInterpolation_Policies(kprime,false,GRIDS)
     itp_bprime=CreateInterpolation_Policies(bprime,false,GRIDS)
 
+    itp_VDhh=CreateInterpolation_ValueFunctions(VDhh,true,GRIDS)
+    itp_VPhh=CreateInterpolation_ValueFunctions(VPhh,false,GRIDS)
+    itp_EVDhh=CreateInterpolation_ValueFunctions(VDhh,true,GRIDS)
+    itp_EVhh=CreateInterpolation_ValueFunctions(VPhh,false,GRIDS)
+
     ### Interpolation objects
     #Input values for end of time
-    return Solution(VD,VP,V,EVD,EV,q1,kprime_D,kprime,bprime,Tr,DEV_RULE,itp_VD,itp_VP,itp_V,itp_EVD,itp_EV,itp_q1,itp_kprime_D,itp_kprime,itp_bprime)
+    return Solution(VD,VP,V,EVD,EV,q1,kprime_D,kprime,bprime,Tr,DEV_RULE,itp_VD,itp_VP,itp_V,itp_EVD,itp_EV,itp_q1,itp_kprime_D,itp_kprime,itp_bprime,VDhh,VPhh,EVDhh,EVhh,itp_VDhh,itp_VPhh,itp_EVDhh,itp_EVhh)
 end
 
 function UnpackParameters_Vector(VEC::Array{Float64})
@@ -501,6 +582,42 @@ function UnpackParameters_Vector(VEC::Array{Float64})
         par=Pars(par,Covenants=true)
     else
         par=Pars(par,Covenants=false)
+    end
+
+    if VEC[19]==1.0
+        par=Pars(par,Decentralized=true)
+    else
+        par=Pars(par,Decentralized=false)
+    end
+
+    if VEC[20]==1.0
+        par=Pars(par,ForeignInvestors=true)
+    else
+        par=Pars(par,ForeignInvestors=false)
+    end
+
+    if VEC[21]==1.0
+        par=Pars(par,Strict=true)
+    else
+        par=Pars(par,Strict=false)
+    end
+
+    if VEC[22]==1.0
+        par=Pars(par,PatientHH=true)
+        βstar=1/(1+par.r_star)
+        βhh=0.5*(par.β+βstar)
+        par=Pars(par,βhh=βhh)
+    else
+        par=Pars(par,PatientHH=false)
+        par=Pars(par,βhh=par.β)
+    end
+
+    par=Pars(par,γ=VEC[23])
+
+    if VEC[24]==1.0
+        par=Pars(par,OnlyBudgetBalance=true)
+    else
+        par=Pars(par,OnlyBudgetBalance=false)
     end
 
     return par
@@ -557,12 +674,14 @@ function Expectation_over_zprime_2(foo,z_ind::Int64,GRIDS::Grids)
     @unpack ϵz_weights, ZPRIME, PDFz, FacQz = GRIDS
     int_v=0.0
     int_q=0.0
+    int_vhh=0.0
     for j in 1:length(ϵz_weights)
-        v, q=foo(ZPRIME[z_ind,j])
+        v, q, vhh=foo(ZPRIME[z_ind,j])
         int_v=int_v+ϵz_weights[j]*PDFz[j]*v
         int_q=int_q+ϵz_weights[j]*PDFz[j]*q
+        int_vhh=int_vhh+ϵz_weights[j]*PDFz[j]*vhh
     end
-    return int_v/FacQz, int_q/FacQz
+    return int_v/FacQz, int_q/FacQz, int_vhh/FacQz
 end
 
 function SDF_Lenders(par::Pars)
@@ -570,12 +689,20 @@ function SDF_Lenders(par::Pars)
     return 1/(1+r_star)
 end
 
-function Calculate_Covenant_b(itp_q1,z::Float64,k::Float64,b::Float64,bprime::Float64,kprime::Float64,par::Pars)
-    @unpack γ, Covenants = par
+function Calculate_Covenant_b(x::State,kprime::Float64,bprime::Float64,SOLUTION::Solution,par::Pars)
+    @unpack Covenants, Decentralized = par
     if Covenants
-        #Compute compensation per remaining bond (1-γ)b for any dilution
-        # qq0=itp_q1((1-γ)*b,kprime,z)
-        qq0=itp_q1((1-γ)*b,k,z)
+        @unpack γ = par
+        @unpack itp_q1 = SOLUTION
+        @unpack z, k, b = x
+        #Compute compensation per remaining bond (1-γ)b
+        if Decentralized
+            #Compensate for dilution due to change in debt
+            qq0=itp_q1((1-γ)*b,kprime,z)
+        else
+            #Compensate for dilution due to change in debt and capital
+            qq0=itp_q1((1-γ)*b,k,z)
+        end
         qq1=itp_q1(bprime,kprime,z)
         return max(0.0,qq0-qq1)
     else
@@ -588,55 +715,119 @@ function ValueAndBondsPayoff(zprime::Float64,kprime::Float64,bprime::Float64,SOL
     vd=min(0.0,itp_VD(kprime,zprime))
     vp=min(0.0,itp_VP(bprime,kprime,zprime))
     if vd>vp
-        return vd, 0.0
+        @unpack PatientHH = par
+        if PatientHH
+            @unpack itp_VDhh = SOLUTION
+            return vd, 0.0, itp_VDhh(kprime,zprime)
+        else
+            return vd, 0.0, vd
+        end
     else
         @unpack γ, κ, qmax = par
         SDF=SDF_Lenders(par)
         if γ==1.0
-            return vp, SDF
+            @unpack PatientHH = par
+            if PatientHH
+                return vp, SDF, vp
+            else
+                return vp, SDF, vp
+            end
         else
             @unpack itp_q1, itp_kprime, itp_bprime = SOLUTION
             kk=itp_kprime(bprime,kprime,zprime)
             bb=itp_bprime(bprime,kprime,zprime)
             qq=min(qmax,max(0.0,itp_q1(bb,kk,zprime)))
-            CC=Calculate_Covenant_b(itp_q1,zprime,kprime,bprime,bb,kk,par)
-            return vp, SDF*(γ+(1-γ)*(κ+qq+CC))
+            if par.Covenants
+                xprime=State(false,zprime,kprime,bprime)
+                CC=Calculate_Covenant_b(xprime,kk,bb,SOLUTION,par)
+            else
+                CC=0.0
+            end
+            @unpack PatientHH = par
+            if PatientHH
+                @unpack itp_VPhh = SOLUTION
+                return vp, SDF*(γ+(1-γ)*(κ+qq+CC)), itp_VPhh(bprime,kprime,zprime)
+            else
+                return vp, SDF*(γ+(1-γ)*(κ+qq+CC)), vp
+            end
         end
     end
 end
 
-function ValueAndBondsPayoff_GRIM(zprime::Float64,kprime::Float64,bprime::Float64,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,par::Pars)
-    vd=min(0.0,SOLUTION.itp_VD(kprime,zprime))
-    vp=min(0.0,SOLUTION.itp_VP(bprime,kprime,zprime))
-    vpNoRule=min(0.0,SOLUTION_NO_RULE.itp_VP(bprime,kprime,zprime))
-    if vd>max(vp,vpNoRule)
-        #Will default for sure
-        return vd, 0.0
+function ValueAndBondsPayoff_Grim(zprime::Float64,kprime::Float64,bprime::Float64,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,par::Pars)
+    @unpack itp_VP, itp_VD = SOLUTION
+    vd=min(0.0,itp_VD(kprime,zprime))
+    vp=min(0.0,itp_VP(bprime,kprime,zprime))
+    vp_no_rule=min(0.0,SOLUTION_NO_RULE.itp_VP(bprime,kprime,zprime))
+    if vd>max(vp,vp_no_rule)
+        #Default, keep rule for later
+        @unpack PatientHH = par
+        if PatientHH
+            @unpack itp_VDhh = SOLUTION
+            return vd, 0.0, itp_VDhh(kprime,zprime)
+        else
+            return vd, 0.0, vd
+        end
     else
-        if vpNoRule>vp
-            #Will deviate from rule
-            @unpack γ, κ, qmax = par
-            SDF=SDF_Lenders(par)
+        @unpack γ, κ, qmax = par
+        SDF=SDF_Lenders(par)
+        if vp>=vp_no_rule
+            #Do not deviate
             if γ==1.0
-                return vpNoRule, SDF
+                @unpack PatientHH = par
+                if PatientHH
+                    @unpack itp_VPhh = SOLUTION
+                    return vp, SDF, itp_VPhh(bprime,kprime,zprime)
+                else
+                    return vp, SDF, vp
+                end
             else
-                kk=SOLUTION_NO_RULE.itp_kprime(bprime,kprime,zprime)
-                bb=SOLUTION_NO_RULE.itp_bprime(bprime,kprime,zprime)
-                qq=min(qmax,max(0.0,SOLUTION_NO_RULE.itp_q1(bb,kk,zprime)))
-                CC=Calculate_Covenant_b(SOLUTION_NO_RULE.itp_q1,zprime,kprime,bprime,bb,kk,par)
-                return vpNoRule, SDF*(γ+(1-γ)*(κ+qq+CC))
+                @unpack itp_q1, itp_kprime, itp_bprime = SOLUTION
+                kk=itp_kprime(bprime,kprime,zprime)
+                bb=itp_bprime(bprime,kprime,zprime)
+                qq=min(qmax,max(0.0,itp_q1(bb,kk,zprime)))
+                if par.Covenants
+                    xprime=State(false,zprime,kprime,bprime)
+                    CC=Calculate_Covenant_b(xprime,kk,bb,SOLUTION,par)
+                else
+                    CC=0.0
+                end
+                @unpack PatientHH = par
+                if PatientHH
+                    @unpack itp_VPhh = SOLUTION
+                    return vp, SDF*(γ+(1-γ)*(κ+qq+CC)), itp_VPhh(bprime,kprime,zprime)
+                else
+                    return vp, SDF*(γ+(1-γ)*(κ+qq+CC)), vp
+                end
             end
         else
-            #Will not deviate from the rule
-            @unpack γ, κ, qmax = par
-            SDF=SDF_Lenders(par)
+            #Deviate
             if γ==1.0
-                return vp, SDF
+                @unpack PatientHH = par
+                if PatientHH
+                    @unpack itp_VPhh = SOLUTION_NO_RULE
+                    return vp_no_rule, SDF, itp_VPhh(bprime,kprime,zprime)
+                else
+                    return vp_no_rule, SDF, vp_no_rule
+                end
             else
-                kk=SOLUTION.itp_kprime(bprime,kprime,zprime)
-                bb=SOLUTION.itp_bprime(bprime,kprime,zprime)
-                qq=min(qmax,max(0.0,SOLUTION.itp_q1(bb,kk,zprime)))
-                return vp, SDF*(γ+(1-γ)*(κ+qq))
+                @unpack itp_q1, itp_kprime, itp_bprime = SOLUTION_NO_RULE
+                kk=itp_kprime(bprime,kprime,zprime)
+                bb=itp_bprime(bprime,kprime,zprime)
+                qq=min(qmax,max(0.0,itp_q1(bb,kk,zprime)))
+                if par.Covenants
+                    xprime=State(false,zprime,kprime,bprime)
+                    CC=Calculate_Covenant_b(xprime,kk,bb,SOLUTION_NO_RULE,par)
+                else
+                    CC=0.0
+                end
+                @unpack PatientHH = par
+                if PatientHH
+                    @unpack itp_VPhh = SOLUTION_NO_RULE
+                    return vp_no_rule, SDF*(γ+(1-γ)*(κ+qq+CC)), itp_VPhh(bprime,kprime,zprime)
+                else
+                    return vp_no_rule, SDF*(γ+(1-γ)*(κ+qq+CC)), vp_no_rule
+                end
             end
         end
     end
@@ -650,6 +841,9 @@ function UpdateExpectations!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
         (k_ind,z_ind)=Tuple(I)
         foo_mat_D=CreateInterpolation_ForExpectations(SOLUTION.VD[k_ind,:],GRIDS)
         SOLUTION.EVD[I]=Expectation_over_zprime(foo_mat_D,z_ind,GRIDS)
+
+        foo_mat_Dhh=CreateInterpolation_ForExpectations(SOLUTION.VDhh[k_ind,:],GRIDS)
+        SOLUTION.EVDhh[I]=Expectation_over_zprime(foo_mat_Dhh,z_ind,GRIDS)
     end
 
     #Repayment and bond price
@@ -658,13 +852,13 @@ function UpdateExpectations!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
         kprime=GRIDS.GR_k[k_ind]
         bprime=GRIDS.GR_b[b_ind]
         foo_mat_vq(zprime::Float64)=ValueAndBondsPayoff(zprime,kprime,bprime,SOLUTION,par)
-        SOLUTION.EV[I], SOLUTION.q1[I]=Expectation_over_zprime_2(foo_mat_vq,z_ind,GRIDS)
+        SOLUTION.EV[I], SOLUTION.q1[I], SOLUTION.EVhh[I]=Expectation_over_zprime_2(foo_mat_vq,z_ind,GRIDS)
     end
 
     return nothing
 end
 
-function UpdateExpectations_GRIM!(SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
+function UpdateExpectations_Grim!(SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
     #Loop over all states to compute expectations over p and z
 
     #Default
@@ -672,6 +866,9 @@ function UpdateExpectations_GRIM!(SOLUTION::Solution,SOLUTION_NO_RULE::Solution,
         (k_ind,z_ind)=Tuple(I)
         foo_mat_D=CreateInterpolation_ForExpectations(SOLUTION.VD[k_ind,:],GRIDS)
         SOLUTION.EVD[I]=Expectation_over_zprime(foo_mat_D,z_ind,GRIDS)
+
+        foo_mat_Dhh=CreateInterpolation_ForExpectations(SOLUTION.VDhh[k_ind,:],GRIDS)
+        SOLUTION.EVDhh[I]=Expectation_over_zprime(foo_mat_Dhh,z_ind,GRIDS)
     end
 
     #Repayment and bond price
@@ -679,8 +876,8 @@ function UpdateExpectations_GRIM!(SOLUTION::Solution,SOLUTION_NO_RULE::Solution,
         (b_ind,k_ind,z_ind)=Tuple(I)
         kprime=GRIDS.GR_k[k_ind]
         bprime=GRIDS.GR_b[b_ind]
-        foo_mat_vq(zprime::Float64)=ValueAndBondsPayoff_GRIM(zprime,kprime,bprime,SOLUTION,SOLUTION_NO_RULE,par)
-        SOLUTION.EV[I], SOLUTION.q1[I]=Expectation_over_zprime_2(foo_mat_vq,z_ind,GRIDS)
+        foo_mat_vq(zprime::Float64)=ValueAndBondsPayoff_Grim(zprime,kprime,bprime,SOLUTION,SOLUTION_NO_RULE,par)
+        SOLUTION.EV[I], SOLUTION.q1[I], SOLUTION.EVhh[I]=Expectation_over_zprime_2(foo_mat_vq,z_ind,GRIDS)
     end
 
     return nothing
@@ -725,18 +922,28 @@ function dΨ_d2(kprime::Float64,k::Float64,par::Pars)
 end
 
 function DebtLimit(z::Float64,k::Float64,b::Float64,par::Pars)
-    @unpack FR, χ, γ = par
+    @unpack FR, χ, γ, OnlyBudgetBalance = par
     #Maximum b/gdp
     y=FinalOutput(z,k,par)
     gdp=4*y    #annualized GDP
-    DL=FR*gdp  #debt limit
-    # DR=χ*y   #minimum debt reduction if b>DL
-    DR=χ*y     #maximum primary deficit if b>DL
-    #the parameter χ controls the maximum forced debt reduction
-    #if shock is so bad that b is way above DL then the
-    #government is not forced to pay all the way down to DL,
-    #just pay, at most, DR
-    return max(DL,(1-γ)*b+DR)
+    if OnlyBudgetBalance
+        DR=χ*gdp   #maximum primary deficit
+        return (1-γ)*b+DR
+    else
+        DL=FR*gdp  #debt limit
+        DR=χ*gdp   #maximum primary deficit if b>DL
+        #the parameter χ controls the maximum forced debt reduction
+        #if shock is so bad that b is way above DL then the
+        #government is not forced to pay all the way down to DL,
+        #just pay, at most, DR
+        if b>=DL
+            #Is binding today, allow adjustment
+            return max(DL,(1-γ)*b+DR)
+        else
+            #Not binding today, cannot get to DL
+            return DL
+        end
+    end
 end
 
 function ComputeSpreadWithQ(qq::Float64,par::Pars)
@@ -746,11 +953,12 @@ function ComputeSpreadWithQ(qq::Float64,par::Pars)
     return 100*(ib-rf)
 end
 
-function Calculate_Tr(z::Float64,k::Float64,b::Float64,kprime::Float64,bprime::Float64,SOLUTION::Solution,par::Pars)
+function Calculate_Tr(x::State,kprime::Float64,bprime::Float64,SOLUTION::Solution,par::Pars)
     @unpack γ, κ = par
     @unpack itp_q1 = SOLUTION
+    @unpack z, b = x
     #Compute net borrowing from the rest of the world
-    Covenant=Calculate_Covenant_b(itp_q1,z,k,b,bprime,kprime,par)
+    Covenant=Calculate_Covenant_b(x,kprime,bprime,SOLUTION,par)
     qq=itp_q1(bprime,kprime,z)
     return qq*(bprime-(1-γ)*b)-(γ+κ*(1-γ))*b-(1-γ)*b*Covenant
 end
@@ -771,69 +979,69 @@ end
 ###############################################################################
 #Function to compute consumption and value given the state and policies
 ###############################################################################
-function ConsNet(y::Float64,k::Float64,kprime::Float64,T::Float64,par::Pars)
-    #Resource constraint for the final good
-    @unpack δ = par
-    inv=kprime-(1-δ)*k
-    AdjCost=CapitalAdjustment(kprime,k,par)
-    return y-inv-AdjCost+T
-end
-
-function Evaluate_cons_state(Default::Bool,I::CartesianIndex,kprime::Float64,Tr::Float64,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    if Default
-        @unpack GR_z, GR_k = GRIDS
-        (k_ind,z_ind)=Tuple(I)
-        z=GR_z[z_ind]; k=GR_k[k_ind]
+function Evaluate_cons_state(x::State,kprime::Float64,Tr::Float64,par::Pars)
+    @unpack ForeignInvestors = par
+    @unpack z, k = x
+    if x.Default
         zD=zDefault(z,par)
         y=FinalOutput(zD,k,par)
-        return ConsNet(y,k,kprime,Tr,par)
     else
-        @unpack GR_z, GR_k, GR_b = GRIDS
-        @unpack itp_q1 = SOLUTION
-        (b_ind,k_ind,z_ind)=Tuple(I)
-        z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
         y=FinalOutput(z,k,par)
-        return ConsNet(y,k,kprime,Tr,par)
     end
-end
 
-function Evaluate_VD(I::CartesianIndex,kprime::Float64,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack β, θ, cmin = par
-    @unpack itp_EV, itp_EVD = SOLUTION
-    (k_ind,z_ind)=Tuple(I)
-    z=GRIDS.GR_z[z_ind]
-    Default=true; Tr=0.0
-    cons=Evaluate_cons_state(Default,I,kprime,Tr,SOLUTION,GRIDS,par)
-    if cons>cmin
-        return Utility(cons,par)+β*θ*itp_EV(0.0,kprime,z)+β*(1.0-θ)*itp_EVD(kprime,z)
+    if ForeignInvestors
+        @unpack α = par
+        W=(1-α)*y
+        return W+Tr
     else
-        return Utility(cmin,par)+cons
+        @unpack δ = par
+        inv=kprime-(1-δ)*k
+        AdjCost=CapitalAdjustment(kprime,k,par)
+        return y-inv-AdjCost+Tr
     end
 end
 
-function Evaluate_VP(I::CartesianIndex,kprime::Float64,bprime::Float64,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+function Evaluate_ValueFunction(IsHousehold::Bool,x::State,kprime::Float64,bprime::Float64,SOLUTION::Solution,par::Pars)
     @unpack β, cmin = par
-    @unpack itp_EV, itp_q1 = SOLUTION
-    @unpack GR_z, GR_k, GR_b = GRIDS
-
-    #Compute consumption
-    #Unpack state
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-    Default=false
-    Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
-    cons=Evaluate_cons_state(Default,I,kprime,Tr,SOLUTION,GRIDS,par)
-    if cons>0.0
-        qq=itp_q1(bprime,kprime,z)
-        if bprime>0.0 && qq==0.0
-            #Small penalty for larger debt positions
-            #wrong side of laffer curve, it is decreasing
-            return Utility(cons,par)+β*itp_EV(bprime,kprime,z)-abs(bprime)*sqrt(eps(Float64))
+    @unpack z = x
+    if x.Default
+        @unpack θ = par
+        @unpack itp_EV, itp_EVD = SOLUTION
+        Tr=0.0
+        cons=Evaluate_cons_state(x,kprime,Tr,par)
+        if cons>cmin
+            if IsHousehold
+                @unpack βhh = par
+                @unpack itp_EVhh, itp_EVDhh = SOLUTION
+                return Utility(cons,par)+βhh*θ*itp_EVhh(0.0,kprime,z)+βhh*(1.0-θ)*itp_EVDhh(kprime,z)
+            else
+                return Utility(cons,par)+β*θ*itp_EV(0.0,kprime,z)+β*(1.0-θ)*itp_EVD(kprime,z)
+            end
         else
-            return Utility(cons,par)+β*itp_EV(bprime,kprime,z)
+            return Utility(cmin,par)+cons
         end
     else
-        return Utility(cmin,par)+cons
+        @unpack itp_EV, itp_q1 = SOLUTION
+        Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+        cons=Evaluate_cons_state(x,kprime,Tr,par)
+        if cons>0.0
+            if IsHousehold
+                @unpack βhh = par
+                @unpack itp_EVhh = SOLUTION
+                return Utility(cons,par)+βhh*itp_EVhh(bprime,kprime,z)
+            else
+                qq=itp_q1(bprime,kprime,z)
+                if bprime>0.0 && qq==0.0
+                    #Small penalty for larger debt positions
+                    #wrong side of laffer curve, it is decreasing
+                    return Utility(cons,par)+β*itp_EV(bprime,kprime,z)-abs(bprime)*sqrt(eps(Float64))
+                else
+                    return Utility(cons,par)+β*itp_EV(bprime,kprime,z)
+                end
+            end
+        else
+            return Utility(cmin,par)+cons
+        end
     end
 end
 
@@ -880,72 +1088,148 @@ function ComputeExpectations_HHRep!(itp_D,itp_R,E_MAT::Array{Float64,3},SOLUTION
     return nothing
 end
 
-function HH_k_Returns_D(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack cmin, β = par
-    @unpack kprime_D = SOLUTION
-    @unpack GR_z, GR_k = GRIDS
-    #Unpack state and compute output
-    (k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]
-    zD=zDefault(z,par)
-
-    Default=true
-    kprimef=kprime_D[I]; Tr=0.0
-    cons=Evaluate_cons_state(Default,I,kprimef,Tr,SOLUTION,GRIDS,par)
-    if cons<=0.0
-        cons=cmin
+function ComputeExpectations_HHRep_Grim!(itp_D,itp_R,itp_R_no_rule,E_MAT::Array{Float64,3},SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
+    #It will use MAT_D and MAT_R to compute expectations
+    #It will change the values in E_MAT
+    #Loop over all states to compute expectations over p and z
+    @unpack itp_VD, itp_VP = SOLUTION
+    @unpack GR_b, GR_k, GR_z = GRIDS
+    for I in CartesianIndices(E_MAT)
+        (b_ind,k_ind,z_ind)=Tuple(I)
+        bprime=GR_b[b_ind]; kprime=GR_k[k_ind]
+        function foo_mat(zprime::Float64)
+            vd=itp_VD(kprime,zprime)
+            vp=itp_VP(bprime,kprime,zprime)
+            vp_no_rule=SOLUTION_NO_RULE.itp_VP(bprime,kprime,zprime)
+            if vd>max(vp,vp_no_rule)
+                return max(0.0,itp_D(kprime,zprime))
+            else
+                if vp>=vp_no_rule
+                    return max(0.0,itp_R(bprime,kprime,zprime))
+                else
+                    return max(0.0,itp_R_no_rule(bprime,kprime,zprime))
+                end
+            end
+        end
+        E_MAT[I]=Expectation_over_zprime(foo_mat,z_ind,GRIDS)
     end
-
-    return β*U_c(cons,par)*R_dec(kprimef,zD,k,par)
+    return nothing
 end
 
-function HH_k_Returns_P(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack cmin, β = par
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    @unpack kprime, Tr = SOLUTION
-    @unpack VP, VD = SOLUTION
-    #Unpack state index
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    #Unpack state and policies
-    z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-    kprimef=kprime[I]
+function HH_k_Returns(Default::Bool,I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack cmin, βhh, ForeignInvestors = par
+    @unpack GR_z, GR_k = GRIDS
 
-    #Compute consumption
-    Default=false
-    kprimef=kprime[I]; T=Tr[I]
-    cons=Evaluate_cons_state(Default,I,kprimef,T,SOLUTION,GRIDS,par)
-    NegConDef=0.0
+    if Default
+        @unpack kprime_D = SOLUTION
+        #Unpack state and compute output
+        (k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]
+        zD=zDefault(z,par)
+        kprimef=kprime_D[I]; T=0.0
 
-    if cons>0.0
-        #Calculate return
-        return β*U_c(cons,par)*R_dec(kprimef,z,k,par), NegConDef
-    else
-        #Use return in default and flag if default is somehow not chosen
-        #this avoids overshooting of interpolation of RN and RT
-        @unpack dR_Def = HH_OBJ
-        if VP[I]>VD[k_ind,z_ind]
-            #Problem, somewhow repay with negative consumption
-            #Flag it
-            NegConDef=1.0
+        if ForeignInvestors
+            return R_dec(kprimef,zD,k,par)
+        else
+            x=State(Default,z,k,0.0)
+            cons=Evaluate_cons_state(x,kprimef,T,par)
+            if cons<=0.0
+                cons=cmin
+            end
+            return βhh*U_c(cons,par)*R_dec(kprimef,zD,k,par)
         end
-        return dR_Def[k_ind,z_ind], NegConDef
+    else
+        @unpack GR_b = GRIDS
+        @unpack kprime, Tr, VP, VD = SOLUTION
+        #Unpack state index
+        (b_ind,k_ind,z_ind)=Tuple(I)
+        #Unpack state and policies
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
+        kprimef=kprime[I]; T=Tr[I]
+
+        if ForeignInvestors
+            return R_dec(kprimef,z,k,par)
+        else
+            x=State(Default,z,k,b)
+            cons=Evaluate_cons_state(x,kprimef,T,par)
+
+            if cons>0.0
+                #Calculate return
+                return βhh*U_c(cons,par)*R_dec(kprimef,z,k,par)
+            else
+                #Use return in default
+                #this avoids overshooting of interpolation of RN and RT
+                return HH_OBJ.dR_Def[k_ind,z_ind]
+            end
+        end
+    end
+end
+
+function HH_k_Returns_Grim(Default::Bool,I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
+    @unpack cmin, βhh, ForeignInvestors = par
+    @unpack GR_z, GR_k = GRIDS
+
+    if Default
+        @unpack kprime_D = SOLUTION
+        #Unpack state and compute output
+        (k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]
+        zD=zDefault(z,par)
+        kprimef=kprime_D[I]; T=0.0
+
+        if ForeignInvestors
+            return R_dec(kprimef,zD,k,par)
+        else
+            x=State(Default,z,k,0.0)
+            cons=Evaluate_cons_state(x,kprimef,T,par)
+            if cons<=0.0
+                cons=cmin
+            end
+            return βhh*U_c(cons,par)*R_dec(kprimef,zD,k,par)
+        end
+    else
+        @unpack GR_b = GRIDS
+        if SOLUTION_NO_RULE.VP[I]>SOLUTION.VP[I]
+            @unpack kprime, Tr, VP, VD = SOLUTION_NO_RULE
+        else
+            @unpack kprime, Tr, VP, VD = SOLUTION
+        end
+        #Unpack state index
+        (b_ind,k_ind,z_ind)=Tuple(I)
+        #Unpack state and policies
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
+        kprimef=kprime[I]; T=Tr[I]
+
+        if ForeignInvestors
+            return R_dec(kprimef,z,k,par)
+        else
+            x=State(Default,z,k,b)
+            cons=Evaluate_cons_state(x,kprimef,T,par)
+
+            if cons>0.0
+                #Calculate return
+                return βhh*U_c(cons,par)*R_dec(kprimef,z,k,par)
+            else
+                #Use return in default
+                #this avoids overshooting of interpolation of RN and RT
+                return HH_OBJ.dR_Def[k_ind,z_ind]
+            end
+        end
     end
 end
 
 function UpdateHH_Obj!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack Nz, Nk, Nb, cmin, β, θ = par
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    @unpack kprime_D = SOLUTION
-    @unpack kprime, bprime, Tr = SOLUTION
     #Loop over all states to fill matrices in default
+    Default=true
     for I in CartesianIndices(HH_OBJ.dR_Def)
-        HH_OBJ.dR_Def[I]=HH_k_Returns_D(I,SOLUTION,GRIDS,par)
+        HH_OBJ.dR_Def[I]=HH_k_Returns(Default,I,HH_OBJ,SOLUTION,GRIDS,par)
     end
     HH_OBJ.itp_dR_Def=CreateInterpolation_HouseholdObjects(HH_OBJ.dR_Def,true,GRIDS)
 
     #Loop over all states to fill matrices in repayment
+    Default=false
     for I in CartesianIndices(HH_OBJ.dR_Rep)
-        HH_OBJ.dR_Rep[I], NegConDef=HH_k_Returns_P(I,HH_OBJ,SOLUTION,GRIDS,par)
+        HH_OBJ.dR_Rep[I]=HH_k_Returns(Default,I,HH_OBJ,SOLUTION,GRIDS,par)
     end
     HH_OBJ.itp_dR_Rep=CreateInterpolation_HouseholdObjects(HH_OBJ.dR_Rep,false,GRIDS)
 
@@ -959,26 +1243,18 @@ function UpdateHH_Obj!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par
     return nothing
 end
 
-function UpdateHH_Obj_GRIM!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
-    @unpack Nz, Nk, Nb, cmin, β, θ = par
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    @unpack kprime_D = SOLUTION
-    @unpack kprime, bprime, Tr = SOLUTION
+function UpdateHH_Obj_Grim!(HH_OBJ::HH_itpObjects,HH_OBJ_NO_RULE::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
     #Loop over all states to fill matrices in default
+    Default=true
     for I in CartesianIndices(HH_OBJ.dR_Def)
-        HH_OBJ.dR_Def[I]=HH_k_Returns_D(I,SOLUTION,GRIDS,par)
+        HH_OBJ.dR_Def[I]=HH_k_Returns_Grim(Default,I,HH_OBJ,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
     end
     HH_OBJ.itp_dR_Def=CreateInterpolation_HouseholdObjects(HH_OBJ.dR_Def,true,GRIDS)
 
     #Loop over all states to fill matrices in repayment
+    Default=false
     for I in CartesianIndices(HH_OBJ.dR_Rep)
-        if SOLUTION.DEV_RULE[I]==1.0
-            #Will definitely break the rule
-            HH_OBJ.dR_Rep[I], NegConDef=HH_k_Returns_P(I,HH_OBJ,SOLUTION_NO_RULE,GRIDS,par)
-        else
-            #Will not break the rule, may default
-            HH_OBJ.dR_Rep[I], NegConDef=HH_k_Returns_P(I,HH_OBJ,SOLUTION,GRIDS,par)
-        end
+        HH_OBJ.dR_Rep[I]=HH_k_Returns_Grim(Default,I,HH_OBJ,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
     end
     HH_OBJ.itp_dR_Rep=CreateInterpolation_HouseholdObjects(HH_OBJ.dR_Rep,false,GRIDS)
 
@@ -987,7 +1263,7 @@ function UpdateHH_Obj_GRIM!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO
     HH_OBJ.itp_ER_Def=CreateInterpolation_HouseholdObjects(HH_OBJ.ER_Def,true,GRIDS)
 
     #Compute expectations in repayment
-    ComputeExpectations_HHRep!(HH_OBJ.itp_dR_Def,HH_OBJ.itp_dR_Rep,HH_OBJ.ER_Rep,SOLUTION,GRIDS,par)
+    ComputeExpectations_HHRep_Grim!(HH_OBJ.itp_dR_Def,HH_OBJ.itp_dR_Rep,HH_OBJ_NO_RULE.itp_dR_Rep,HH_OBJ.ER_Rep,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
     HH_OBJ.itp_ER_Rep=CreateInterpolation_HouseholdObjects(HH_OBJ.ER_Rep,false,GRIDS)
     return nothing
 end
@@ -1018,41 +1294,42 @@ end
 #Functions to optimize given guesses and state
 ###############################################################################
 #Functions to compute FOCs given (s,x) and a try of K'
-function HH_FOC_Def(I::CartesianIndex,kprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack cmin = par
-    @unpack GR_z, GR_k = GRIDS
-    @unpack itp_ER_Def = HH_OBJ
-    (k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]
-    #Compute present consumption
-    Default=true; Tr=0.0
-    c=max(cmin,Evaluate_cons_state(Default,I,kprime,Tr,SOLUTION,GRIDS,par))
-
-    # compute expectation over z and yC
-    Ev=itp_ER_Def(kprime,z)
-    #compute extra term and return FOC
+function HH_FOC(x::State,kprime::Float64,bprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack cmin, ForeignInvestors = par
+    @unpack Default, z, k = x
+    #compute term related to adjustment cost
     ψ1=dΨ_d1(kprime,k,par)
-    return Ev-U_c(c,par)*(1.0+ψ1)
-end
-
-function HH_FOC_Rep(I::CartesianIndex,kprime::Float64,bprime::Float64,
-                    HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack cmin = par
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    @unpack itp_q1 = SOLUTION
-    @unpack itp_ER_Rep = HH_OBJ
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-
-    #Compute present consumption
-    Default=false; Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
-    c=max(cmin,Evaluate_cons_state(Default,I,kprime,Tr,SOLUTION,GRIDS,par))
-
-    #compute expectation over z and yC
-    Ev=itp_ER_Rep(bprime,kprime,z)
-    #compute extra term and return FOC
-    ψ1=dΨ_d1(kprime,k,par)
-    return Ev-U_c(c,par)*(1.0+ψ1)
+    if Default
+        @unpack itp_ER_Def = HH_OBJ
+        # compute expectation over z
+        Ev=itp_ER_Def(kprime,z)
+        if ForeignInvestors
+            @unpack r_star = par
+            return Ev-(1+r_star)*(1.0+ψ1)
+        else
+            #Compute present consumption
+            Tr=0.0
+            cons=Evaluate_cons_state(x,kprime,Tr,par)
+            c=max(cmin,cons)
+            #Return FOC
+            return Ev-U_c(c,par)*(1.0+ψ1)
+        end
+    else
+        @unpack itp_ER_Rep = HH_OBJ
+        #compute expectation over z
+        Ev=itp_ER_Rep(bprime,kprime,z)
+        if ForeignInvestors
+            @unpack r_star = par
+            return Ev-(1+r_star)*(1.0+ψ1)
+        else
+            #Compute present consumption
+            Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+            cons=Evaluate_cons_state(x,kprime,Tr,par)
+            c=max(cmin,cons)
+            #Return FOC
+            return Ev-U_c(c,par)*(1.0+ψ1)
+        end
+    end
 end
 
 #Functions to compute optimal capital policy from FOCs
@@ -1085,44 +1362,32 @@ function FindBracketing(foo,ν::Float64,x0::Float64,xmin::Float64,xmax::Float64)
     return xL, xH
 end
 
-function HHOptim_Def(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack GR_k = GRIDS
-    (k_ind,z_ind)=Tuple(I)
-    k=GR_k[k_ind]
-
-    foo(kprime::Float64)=HH_FOC_Def(I,kprime,HH_OBJ,SOLUTION,GRIDS,par)
+function HHOptim(x::State,bprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack k = x
+    foo(kprime::Float64)=HH_FOC(x,kprime,bprime,HH_OBJ,SOLUTION,GRIDS,par)
     ν=0.05
     kkL, kkH=FindBracketing(foo,ν,k,k-ν,k+ν)
     kk=MyBisection(foo,kkL,kkH;xatol=1e-6)
 
-    Default=true; Tr=0.0
-    cons=Evaluate_cons_state(Default,I,kk,Tr,SOLUTION,GRIDS,par)
-    while cons<0.0
-        kk=0.5*(k+kk)
-        cons=Evaluate_cons_state(Default,I,kk,Tr,SOLUTION,GRIDS,par)
+    if x.Default
+        Tr=0.0
+        cons=Evaluate_cons_state(x,kk,Tr,par)
+        while cons<0.0
+            kk=0.5*(k+kk)
+            cons=Evaluate_cons_state(x,kk,Tr,par)
+        end
+        return kk
+    else
+        return kk
     end
-    return kk
 end
 
-function HHOptim_Rep(I::CartesianIndex,bprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack GR_k = GRIDS
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    k=GR_k[k_ind]
-
-    foo(kprime::Float64)=HH_FOC_Rep(I,kprime,bprime,HH_OBJ,SOLUTION,GRIDS,par)
-    ν=0.05
-    kkL, kkH=FindBracketing(foo,ν,k,k-ν,k+ν)
-    kk=MyBisection(foo,kkL,kkH;xatol=1e-6)
-
-    return kk
-end
-
-function GridSearchOverK_D(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    kpol=0
+function GridSearchOverK_D(x::State,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    kpol=0; bprime=0.0 #This is only used for the planner in Default
     val=-Inf
     for ktry in 1:length(GRIDS.GR_k)
         kprime=GRIDS.GR_k[ktry]
-        vv=Evaluate_VD(I,kprime,SOLUTION,GRIDS,par)
+        vv=Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
         if vv>val
             val=vv
             kpol=ktry
@@ -1150,29 +1415,65 @@ function GridSearchOverK_D(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par
     return klow, khigh
 end
 
-function OptimInDefault_PLA(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack GR_z, GR_k = GRIDS
-    (k_ind,z_ind)=Tuple(I)
-
-    klow, khigh=GridSearchOverK_D(I,SOLUTION,GRIDS,par)
-    foo(kprime::Float64)=-Evaluate_VD(I,kprime,SOLUTION,GRIDS,par)
-    res=optimize(foo,klow,khigh,GoldenSection())
-
-    return -Optim.minimum(res), Optim.minimizer(res)
+function Search_bprime_unconstrained(x::State,kprime::Float64,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack GR_b = GRIDS
+    val=-Inf
+    bpol=0
+    for btry in 1:par.Nb
+        vv=Evaluate_ValueFunction(false,x,kprime,GR_b[btry],SOLUTION,par)
+        if vv>val
+            val=vv
+            bpol=btry
+        end
+    end
+    if bpol>1
+        blowOpt=GR_b[bpol-1]
+    else
+        blowOpt=par.blowOpt
+    end
+    if bpol<par.Nb
+        bhighOpt=GR_b[bpol+1]
+    else
+        bhighOpt=par.bhighOpt
+    end
+    return blowOpt, bhighOpt
 end
 
-function OptimInDefault_DEC(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    kprime=HHOptim_Def(I,HH_OBJ,SOLUTION,GRIDS,par)
-    val=Evaluate_VD(I,kprime,SOLUTION,GRIDS,par)
-    return val, kprime
+function BoundsForBprime(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack GR_z, GR_k, GR_b = GRIDS
+    (b_ind,k_ind,z_ind)=Tuple(I)
+    Default=false; z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
+    x=State(Default,z,k,b)
+
+    if SOLUTION.kprime[I]==0.0
+        kprime=GR_k[k_ind]
+    else
+        kprime=SOLUTION.kprime[I]
+    end
+
+    blowOpt, bhighOpt=Search_bprime_unconstrained(x,kprime,SOLUTION,GRIDS,par)
+
+    if par.WithFR
+        bbar=DebtLimit(z,k,b,par)
+        if bbar<blowOpt
+            #blowOpt is lower bound of tight interval
+            #that contains best b' in grid, this means
+            #that the debt limit is binding
+            return 0.9*bbar, bbar
+        else
+            return blowOpt, min(bbar,bhighOpt)
+        end
+    else
+        return blowOpt, bhighOpt
+    end
 end
 
-function InitialPolicyGuess_P(PreviousPolicy::Bool,I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+function InitialPolicyGuess_Planner(PreviousPolicy::Bool,I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
     (b_ind,k_ind,z_ind)=Tuple(I)
     if PreviousPolicy
-        #Choose last policy as initial guess for capital
+        #Choose policy from previous iteration as initial guess for capital
         if SOLUTION.kprime[I]==0.0
-            #It is the first attempt, use current kN
+            #It is the first attempt, use current k
             k0=GRIDS.GR_k[k_ind]
         else
             if SOLUTION.kprime[I]<GRIDS.GR_k[end]
@@ -1198,225 +1499,169 @@ function InitialPolicyGuess_P(PreviousPolicy::Bool,I::CartesianIndex,SOLUTION::S
     end
 end
 
-function ValueInRepayment_PLA(blowOpt::Float64,bhighOpt::Float64,I::CartesianIndex,X_REAL::Array{Float64,1},SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack klowOpt, khighOpt = par
+function ValueInRepayment_PLA(x::State,klowOpt::Float64,khighOpt::Float64,blowOpt::Float64,bhighOpt::Float64,X_REAL::Array{Float64,1},SOLUTION::Solution,GRIDS::Grids,par::Pars)
     #transform policy tries into interval
     kprime=TransformIntoBounds(X_REAL[1],klowOpt,khighOpt)
     bprime=TransformIntoBounds(X_REAL[2],blowOpt,bhighOpt)
-    vv=Evaluate_VP(I,kprime,bprime,SOLUTION,GRIDS,par)
+    vv=Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
     return vv
 end
 
-function ValueInRepayment_DEC(I::CartesianIndex,bprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    #transform policy tries into interval
-    kprime=HHOptim_Rep(I,bprime,HH_OBJ,SOLUTION,GRIDS,par)
-    vv=Evaluate_VP(I,kprime,bprime,SOLUTION,GRIDS,par)
-    return vv
-end
-
-function Search_bprime_unconstrained(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack GR_k, GR_b = GRIDS
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    if SOLUTION.kprime[I]==0.0
-        kprime=GR_k[k_ind]
+function ValueInRepayment_DEC(x::State,I::CartesianIndex,bprime::Float64,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack Strict = par
+    if Strict
+        kprime=HHOptim(x,bprime,HH_OBJ,SOLUTION,GRIDS,par)
     else
         kprime=SOLUTION.kprime[I]
     end
-    val=-Inf
-    bpol=0
-    for btry in 1:par.Nb
-        vv=Evaluate_VP(I,kprime,GR_b[btry],SOLUTION,GRIDS,par)
-        if vv>val
-            val=vv
-            bpol=btry
-        end
-    end
-    if bpol>1
-        blowOpt=GR_b[bpol-1]
-    else
-        blowOpt=par.blowOpt
-    end
-    if bpol<par.Nb
-        bhighOpt=GR_b[bpol+1]
-    else
-        bhighOpt=par.bhighOpt
-    end
-    return blowOpt, bhighOpt
+    vv=Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
+    return vv
 end
 
-function BoundsForBprime(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    blowOpt, bhighOpt=Search_bprime_unconstrained(I,SOLUTION,GRIDS,par)
-    if par.WithFR
-        @unpack GR_z, GR_k, GR_b = GRIDS
+function Optimizer_Planner(Default::Bool,I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack GR_z, GR_k = GRIDS
+    if Default
+        (k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=0.0
+        x=State(Default,z,k,b); bprime=0.0
+        klow, khigh=GridSearchOverK_D(x,SOLUTION,GRIDS,par)
+        foo(kprime::Float64)=-Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
+        res=optimize(foo,klow,khigh,GoldenSection())
+        return -Optim.minimum(res), Optim.minimizer(res)
+    else
+        @unpack klowOpt, khighOpt = par
+        @unpack GR_b = GRIDS
         (b_ind,k_ind,z_ind)=Tuple(I)
         z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-        bbar=DebtLimit(z,k,b,par)
-        if bbar<blowOpt
-            return par.blowOpt, bbar
-        else
-            return blowOpt, min(bbar,bhighOpt)
+        x=State(Default,z,k,b)
+
+        blowOpt, bhighOpt=BoundsForBprime(I,SOLUTION,GRIDS,par)
+        if blowOpt==bhighOpt
+            blowOpt=par.blowOpt
         end
-    else
-        return blowOpt, bhighOpt
+
+        PreviousPolicy=true
+        X0_BOUNDS=InitialPolicyGuess_Planner(PreviousPolicy,I,SOLUTION,GRIDS,par)
+        X0=Array{Float64,1}(undef,2)
+        X0[1]=TransformIntoReals(X0_BOUNDS[1],klowOpt,khighOpt)
+        if X0_BOUNDS[2]<bhighOpt && X0_BOUNDS[2]>blowOpt
+            X0[2]=TransformIntoReals(X0_BOUNDS[2],blowOpt,bhighOpt)
+        else
+            X0[2]=TransformIntoReals(0.5*(blowOpt+bhighOpt),blowOpt,bhighOpt)
+        end
+
+        foo_P(X_REAL::Array{Float64,1})=-ValueInRepayment_PLA(x,klowOpt,khighOpt,blowOpt,bhighOpt,X_REAL,SOLUTION,GRIDS,par)
+        res=optimize(foo_P,X0,NelderMead())
+        vv=-Optim.minimum(res)
+        kprime=TransformIntoBounds(Optim.minimizer(res)[1],klowOpt,khighOpt)
+        bprime=TransformIntoBounds(Optim.minimizer(res)[2],blowOpt,bhighOpt)
+        Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+        return vv, kprime, bprime, Tr
     end
 end
 
-function OptimInRepayment_PLA(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    @unpack klowOpt, khighOpt = par
-    blowOpt, bhighOpt=BoundsForBprime(I,SOLUTION,GRIDS,par)
-    if blowOpt==bhighOpt
-        blowOpt=par.blowOpt
-    end
+function Optimizer_Decentralized(Default::Bool,I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack GR_z, GR_k = GRIDS
+    if Default
+        (k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=0.0
+        x=State(Default,z,k,b); bprime=0.0
 
-    PreviousPolicy=true
-    X0_BOUNDS=InitialPolicyGuess_P(PreviousPolicy,I,SOLUTION,GRIDS,par)
-    X0=Array{Float64,1}(undef,2)
-    X0[1]=TransformIntoReals(X0_BOUNDS[1],klowOpt,khighOpt)
-    if X0_BOUNDS[2]<bhighOpt && X0_BOUNDS[2]>blowOpt
-        X0[2]=TransformIntoReals(X0_BOUNDS[2],blowOpt,bhighOpt)
+        kprime=HHOptim(x,bprime,HH_OBJ,SOLUTION,GRIDS,par)
+        val=Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
+        return val, kprime
     else
-        X0[2]=TransformIntoReals(0.5*(blowOpt+bhighOpt),blowOpt,bhighOpt)
+        @unpack GR_b = GRIDS
+        (b_ind,k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
+        x=State(Default,z,k,b)
+
+        blowOpt, bhighOpt=BoundsForBprime(I,SOLUTION,GRIDS,par)
+        foo(bprime::Float64)=-ValueInRepayment_DEC(x,I,bprime,HH_OBJ,SOLUTION,GRIDS,par)
+        res=optimize(foo,blowOpt,bhighOpt,GoldenSection())
+
+        bprime=Optim.minimizer(res)
+        kprime=HHOptim(x,bprime,HH_OBJ,SOLUTION,GRIDS,par)
+        Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+        return -Optim.minimum(res), kprime, bprime, Tr
     end
-
-    foo(X::Array{Float64,1})=-ValueInRepayment_PLA(blowOpt,bhighOpt,I,X,SOLUTION,GRIDS,par)
-    res=optimize(foo,X0,NelderMead())
-    vv=-Optim.minimum(res)
-    kprime=TransformIntoBounds(Optim.minimizer(res)[1],klowOpt,khighOpt)
-    bprime=TransformIntoBounds(Optim.minimizer(res)[2],blowOpt,bhighOpt)
-
-    @unpack itp_q1 = SOLUTION
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-    Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
-    return vv, kprime, bprime, Tr
-end
-
-function OptimInRepayment_DEC(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    blowOpt, bhighOpt=BoundsForBprime(I,SOLUTION,GRIDS,par)
-
-    foo(bprime::Float64)=-ValueInRepayment_DEC(I,bprime,HH_OBJ,SOLUTION,GRIDS,par)
-    res=optimize(foo,blowOpt,bhighOpt,GoldenSection())
-    bprime=Optim.minimizer(res)
-    kprime=HHOptim_Rep(I,bprime,HH_OBJ,SOLUTION,GRIDS,par)
-
-    @unpack itp_q1 = SOLUTION
-    @unpack GR_z, GR_k, GR_b = GRIDS
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
-    Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
-    return -Optim.minimum(res), kprime, bprime, Tr
 end
 
 ###############################################################################
 #Update solution
 ###############################################################################
-function DefaultUpdater_PLA!(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    SOLUTION.VD[I], SOLUTION.kprime_D[I]=OptimInDefault_PLA(I,SOLUTION,GRIDS,par)
-    return nothing
-end
-
-function DefaultUpdater_DEC!(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    SOLUTION.VD[I], SOLUTION.kprime_D[I]=OptimInDefault_DEC(I,HH_OBJ,SOLUTION,GRIDS,par)
-    return nothing
-end
-
-function UpdateDefault_PLA!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    #Loop over all states to fill array of VD
-    for I in CartesianIndices(SOLUTION.VD)
-        DefaultUpdater_PLA!(I,SOLUTION,GRIDS,par)
-    end
-    IsDefault=true
-    SOLUTION.itp_VD=CreateInterpolation_ValueFunctions(SOLUTION.VD,IsDefault,GRIDS)
-    SOLUTION.itp_kprime_D=CreateInterpolation_Policies(SOLUTION.kprime_D,IsDefault,GRIDS)
-
-    return nothing
-end
-
-function UpdateDefault_DEC!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    #Loop over all states to fill array of VD
-    for I in CartesianIndices(SOLUTION.VD)
-        DefaultUpdater_DEC!(I,HH_OBJ,SOLUTION,GRIDS,par)
-    end
-    IsDefault=true
-    SOLUTION.itp_VD=CreateInterpolation_ValueFunctions(SOLUTION.VD,IsDefault,GRIDS)
-    SOLUTION.itp_kprime_D=CreateInterpolation_Policies(SOLUTION.kprime_D,IsDefault,GRIDS)
-
-    return nothing
-end
-
-function UpdateDefault_GRIM!(RuleAfterDefault::Bool,HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids)
-    #Loop over all states to fill array of VD
-    if RuleAfterDefault
-        for I in CartesianIndices(SOLUTION.VD)
-            DefaultUpdater_DEC!(I,HH_OBJ,SOLUTION,GRIDS,par)
+function DefaultUpdater!(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack Decentralized, PatientHH = par
+    Default=true
+    if Decentralized
+        SOLUTION.VD[I], SOLUTION.kprime_D[I]=Optimizer_Decentralized(Default,I,HH_OBJ,SOLUTION,GRIDS,par)
+        if PatientHH
+            @unpack GR_z, GR_k = GRIDS
+            IsHousehold=true
+            (k_ind,z_ind)=Tuple(I)
+            z=GR_z[z_ind]; k=GR_k[k_ind]; b=0.0
+            x=State(Default,z,k,b)
+            kprime=SOLUTION.kprime_D[I]
+            bprime=0.0
+            SOLUTION.VDhh[I]=Evaluate_ValueFunction(IsHousehold,x,kprime,bprime,SOLUTION,par)
+        else
+            SOLUTION.VDhh[I]=SOLUTION.VD[I]
         end
+        return nothing
     else
-        for I in CartesianIndices(SOLUTION.VD)
-            SOLUTION.VD[I]=SOLUTION_NO_RULE.VD[I]
-            SOLUTION.kprime_D[I]=SOLUTION_NO_RULE.kprime_D[I]
-        end
+        SOLUTION.VD[I], SOLUTION.kprime_D[I]=Optimizer_Planner(Default,I,SOLUTION,GRIDS,par)
+        SOLUTION.VDhh[I]=SOLUTION.VD[I]
+        return nothing
     end
-
-    IsDefault=true
-    SOLUTION.itp_VD=CreateInterpolation_ValueFunctions(SOLUTION.VD,IsDefault,GRIDS)
-    SOLUTION.itp_kprime_D=CreateInterpolation_Policies(SOLUTION.kprime_D,IsDefault,GRIDS)
-
-    return nothing
 end
 
-function RepaymentUpdater_PLA!(I::CartesianIndex,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    SOLUTION.VP[I], SOLUTION.kprime[I], SOLUTION.bprime[I], SOLUTION.Tr[I]=OptimInRepayment_PLA(I,SOLUTION,GRIDS,par)
+function RepaymentUpdater!(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack Decentralized, PatientHH = par
+    Default=false
+    if Decentralized
+        SOLUTION.VP[I], SOLUTION.kprime[I], SOLUTION.bprime[I], SOLUTION.Tr[I]=Optimizer_Decentralized(Default,I,HH_OBJ,SOLUTION,GRIDS,par)
+    else
+        SOLUTION.VP[I], SOLUTION.kprime[I], SOLUTION.bprime[I], SOLUTION.Tr[I]=Optimizer_Planner(Default,I,SOLUTION,GRIDS,par)
+    end
     (b_ind,k_ind,z_ind)=Tuple(I)
     if SOLUTION.VP[I]<SOLUTION.VD[k_ind,z_ind]
         SOLUTION.V[I]=SOLUTION.VD[k_ind,z_ind]
     else
         SOLUTION.V[I]=SOLUTION.VP[I]
     end
-    return nothing
-end
-
-function RepaymentUpdater_DEC!(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    SOLUTION.VP[I], SOLUTION.kprime[I], SOLUTION.bprime[I], SOLUTION.Tr[I]=OptimInRepayment_DEC(I,HH_OBJ,SOLUTION,GRIDS,par)
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    if SOLUTION.VP[I]<SOLUTION.VD[k_ind,z_ind]
-        SOLUTION.V[I]=SOLUTION.VD[k_ind,z_ind]
+    if PatientHH
+        @unpack GR_z, GR_k, GR_b = GRIDS
+        IsHousehold=true
+        (b_ind,k_ind,z_ind)=Tuple(I)
+        z=GR_z[z_ind]; k=GR_k[k_ind]; b=GR_b[b_ind]
+        x=State(Default,z,k,b)
+        kprime=SOLUTION.kprime[I]
+        bprime=SOLUTION.bprime[I]
+        SOLUTION.VPhh[I]=Evaluate_ValueFunction(IsHousehold,x,kprime,bprime,SOLUTION,par)
     else
-        SOLUTION.V[I]=SOLUTION.VP[I]
+        SOLUTION.VPhh[I]=SOLUTION.VP[I]
     end
     return nothing
 end
 
-function RepaymentUpdater_GRIM!(I::CartesianIndex,HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
-    SOLUTION.VP[I], SOLUTION.kprime[I], SOLUTION.bprime[I], SOLUTION.Tr[I]=OptimInRepayment_DEC(I,HH_OBJ,SOLUTION,GRIDS,par)
-    (b_ind,k_ind,z_ind)=Tuple(I)
-    if SOLUTION.VP[I]<SOLUTION_NO_RULE.VP[I]
-        #Prefer to deviate than uphold, check if would rather default
-        if SOLUTION_NO_RULE.VP[I]<SOLUTION.VD[k_ind,z_ind]
-            #Default instead of deviating from rule
-            SOLUTION.DEV_RULE[I]=0.0
-            SOLUTION.V[I]=SOLUTION.VD[k_ind,z_ind]
-        else
-            #Deviate from rule
-            SOLUTION.DEV_RULE[I]=1.0
-            SOLUTION.V[I]=SOLUTION_NO_RULE.VP[I]
-        end
-    else
-        #Prefer to uphold than to deviate, check if want to default
-        SOLUTION.DEV_RULE[I]=0.0
-        if SOLUTION.VP[I]<SOLUTION.VD[k_ind,z_ind]
-            SOLUTION.V[I]=SOLUTION.VD[k_ind,z_ind]
-        else
-            SOLUTION.V[I]=SOLUTION.VP[I]
-        end
+function UpdateDefault!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    #Loop over all states to fill array of VD
+    for I in CartesianIndices(SOLUTION.VD)
+        DefaultUpdater!(I,HH_OBJ,SOLUTION,GRIDS,par)
     end
+
+    IsDefault=true
+    SOLUTION.itp_VD=CreateInterpolation_ValueFunctions(SOLUTION.VD,IsDefault,GRIDS)
+    SOLUTION.itp_kprime_D=CreateInterpolation_Policies(SOLUTION.kprime_D,IsDefault,GRIDS)
+    SOLUTION.itp_VDhh=CreateInterpolation_ValueFunctions(SOLUTION.VDhh,IsDefault,GRIDS)
+
     return nothing
 end
 
-function UpdateRepayment_PLA!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
+function UpdateRepayment!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
     #Loop over all states to fill array of VD
     for I in CartesianIndices(SOLUTION.VP)
-        RepaymentUpdater_PLA!(I,SOLUTION,GRIDS,par)
+        RepaymentUpdater!(I,HH_OBJ,SOLUTION,GRIDS,par)
     end
 
     IsDefault=false
@@ -1424,51 +1669,50 @@ function UpdateRepayment_PLA!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
     SOLUTION.itp_V=CreateInterpolation_ValueFunctions(SOLUTION.V,IsDefault,GRIDS)
     SOLUTION.itp_kprime=CreateInterpolation_Policies(SOLUTION.kprime,IsDefault,GRIDS)
     SOLUTION.itp_bprime=CreateInterpolation_Policies(SOLUTION.bprime,IsDefault,GRIDS)
+    SOLUTION.itp_VPhh=CreateInterpolation_ValueFunctions(SOLUTION.VPhh,IsDefault,GRIDS)
 
     return nothing
 end
 
-function UpdateRepayment_DEC!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    #Loop over all states to fill array of VD
-    for I in CartesianIndices(SOLUTION.VP)
-        RepaymentUpdater_DEC!(I,HH_OBJ,SOLUTION,GRIDS,par)
-    end
-
-    IsDefault=false
-    SOLUTION.itp_VP=CreateInterpolation_ValueFunctions(SOLUTION.VP,IsDefault,GRIDS)
-    SOLUTION.itp_V=CreateInterpolation_ValueFunctions(SOLUTION.V,IsDefault,GRIDS)
-    SOLUTION.itp_kprime=CreateInterpolation_Policies(SOLUTION.kprime,IsDefault,GRIDS)
-    SOLUTION.itp_bprime=CreateInterpolation_Policies(SOLUTION.bprime,IsDefault,GRIDS)
-
-    return nothing
-end
-
-function UpdateRepayment_GRIM!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
-    #Loop over all states to fill array of VD
-    for I in CartesianIndices(SOLUTION.VP)
-        RepaymentUpdater_GRIM!(I,HH_OBJ,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
-    end
-
-    IsDefault=false
-    SOLUTION.itp_VP=CreateInterpolation_ValueFunctions(SOLUTION.VP,IsDefault,GRIDS)
-    SOLUTION.itp_V=CreateInterpolation_ValueFunctions(SOLUTION.V,IsDefault,GRIDS)
-    SOLUTION.itp_kprime=CreateInterpolation_Policies(SOLUTION.kprime,IsDefault,GRIDS)
-    SOLUTION.itp_bprime=CreateInterpolation_Policies(SOLUTION.bprime,IsDefault,GRIDS)
-
-    return nothing
-end
-
-function UpdateSolution_PLA!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    UpdateDefault_PLA!(SOLUTION,GRIDS,par)
-    UpdateRepayment_PLA!(SOLUTION,GRIDS,par)
+function UpdateSolution!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    UpdateDefault!(HH_OBJ,SOLUTION,GRIDS,par)
+    UpdateRepayment!(HH_OBJ,SOLUTION,GRIDS,par)
     UpdateExpectations!(SOLUTION,GRIDS,par)
 
     #Compute expectation interpolations
     IsDefault=true
     SOLUTION.itp_EVD=CreateInterpolation_ValueFunctions(SOLUTION.EVD,IsDefault,GRIDS)
+    SOLUTION.itp_EVDhh=CreateInterpolation_ValueFunctions(SOLUTION.EVDhh,IsDefault,GRIDS)
     IsDefault=false
     SOLUTION.itp_EV=CreateInterpolation_ValueFunctions(SOLUTION.EV,IsDefault,GRIDS)
     SOLUTION.itp_q1=CreateInterpolation_Price(SOLUTION.q1,GRIDS)
+    SOLUTION.itp_EVhh=CreateInterpolation_ValueFunctions(SOLUTION.EVhh,IsDefault,GRIDS)
+
+    @unpack Decentralized = par
+    if Decentralized
+        UpdateHH_Obj!(HH_OBJ,SOLUTION,GRIDS,par)
+    end
+    return nothing
+end
+
+function UpdateSolution_Grim!(HH_OBJ::HH_itpObjects,HH_OBJ_NO_RULE::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
+    UpdateDefault!(HH_OBJ,SOLUTION,GRIDS,par)
+    UpdateRepayment!(HH_OBJ,SOLUTION,GRIDS,par)
+    UpdateExpectations_Grim!(SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
+
+    #Compute expectation interpolations
+    IsDefault=true
+    SOLUTION.itp_EVD=CreateInterpolation_ValueFunctions(SOLUTION.EVD,IsDefault,GRIDS)
+    SOLUTION.itp_EVDhh=CreateInterpolation_ValueFunctions(SOLUTION.EVDhh,IsDefault,GRIDS)
+    IsDefault=false
+    SOLUTION.itp_EV=CreateInterpolation_ValueFunctions(SOLUTION.EV,IsDefault,GRIDS)
+    SOLUTION.itp_q1=CreateInterpolation_Price(SOLUTION.q1,GRIDS)
+    SOLUTION.itp_EVhh=CreateInterpolation_ValueFunctions(SOLUTION.EVhh,IsDefault,GRIDS)
+
+    @unpack Decentralized = par
+    if Decentralized
+        UpdateHH_Obj_Grim!(HH_OBJ,HH_OBJ_NO_RULE,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
+    end
     return nothing
 end
 
@@ -1486,38 +1730,6 @@ function UpdateSolution_Closed!(SOLUTION::Solution,GRIDS::Grids,par::Pars)
     #Compute expectation interpolations
     IsDefault=true
     SOLUTION.itp_EVD=CreateInterpolation_ValueFunctions(SOLUTION.EVD,IsDefault,GRIDS)
-    return nothing
-end
-
-function UpdateSolution_DEC!(HH_OBJ::HH_itpObjects,SOLUTION::Solution,GRIDS::Grids,par::Pars)
-    UpdateDefault_DEC!(HH_OBJ,SOLUTION,GRIDS,par)
-    UpdateRepayment_DEC!(HH_OBJ,SOLUTION,GRIDS,par)
-    UpdateExpectations!(SOLUTION,GRIDS,par)
-
-    #Compute expectation interpolations
-    IsDefault=true
-    SOLUTION.itp_EVD=CreateInterpolation_ValueFunctions(SOLUTION.EVD,IsDefault,GRIDS)
-    IsDefault=false
-    SOLUTION.itp_EV=CreateInterpolation_ValueFunctions(SOLUTION.EV,IsDefault,GRIDS)
-    SOLUTION.itp_q1=CreateInterpolation_Price(SOLUTION.q1,GRIDS)
-
-    UpdateHH_Obj!(HH_OBJ,SOLUTION,GRIDS,par)
-    return nothing
-end
-
-function UpdateSolution_GRIM!(RuleAfterDefault::Bool,HH_OBJ_FR::HH_itpObjects,SOLUTION::Solution,SOLUTION_NO_RULE::Solution,GRIDS::Grids,par::Pars)
-    UpdateDefault_GRIM!(RuleAfterDefault,HH_OBJ_FR,SOLUTION,SOLUTION_NO_RULE,GRIDS)
-    UpdateRepayment_GRIM!(HH_OBJ_FR,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
-    UpdateExpectations_GRIM!(SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
-
-    #Compute expectation interpolations
-    IsDefault=true
-    SOLUTION.itp_EVD=CreateInterpolation_ValueFunctions(SOLUTION.EVD,IsDefault,GRIDS)
-    IsDefault=false
-    SOLUTION.itp_EV=CreateInterpolation_ValueFunctions(SOLUTION.EV,IsDefault,GRIDS)
-    SOLUTION.itp_q1=CreateInterpolation_Price(SOLUTION.q1,GRIDS)
-
-    UpdateHH_Obj_GRIM!(HH_OBJ_FR,SOLUTION,SOLUTION_NO_RULE,GRIDS,par)
     return nothing
 end
 
@@ -1541,168 +1753,121 @@ function ComputeDistanceV(SOLUTION_CURRENT::Solution,SOLUTION_NEXT::Solution,par
     return round(abs(dst_D),digits=7), round(abs(dst_V),digits=7), Iv, round(NotConvPct,digits=2)
 end
 
-function SolveModel_VFI(Decentralized::Bool,PrintProg::Bool,PrintAll::Bool,GRIDS::Grids,par::Pars)
-    @unpack Tol_q, Tol_V, cnt_max = par
+function SolveModel_VFI(PrintProg::Bool,GRIDS::Grids,par::Pars)
+    @unpack Tol_q, Tol_V, cnt_max, Decentralized, ForeignInvestors = par
     if PrintProg
         println("Preparing solution guess")
     end
     SOLUTION_CURRENT=InitiateEmptySolution(GRIDS,par)
-    if Decentralized
-        HH_OBJ=InitiateHH_Obj(SOLUTION_CURRENT,GRIDS,par)
-    end
     SOLUTION_NEXT=deepcopy(SOLUTION_CURRENT)
-    dst_V=1.0
-    dst_D=1.0
-    dst_P=1.0
-    NotConvPct_P=1.0
-    dst_q=1.0
-    NotConvPct=100.0
+    HH_OBJ=InitiateHH_Obj(SOLUTION_CURRENT,GRIDS,par)
+    dst_V=1.0; dst_D=1.0; dst_P=1.0; NotConvPct_P=1.0; dst_q=1.0; NotConvPct=100.0
     cnt=0
     if PrintProg
         println("Starting VFI")
     end
     while cnt<cnt_max && (dst_V>Tol_V || dst_q>Tol_q)
-        if Decentralized
-            UpdateSolution_DEC!(HH_OBJ,SOLUTION_NEXT,GRIDS,par)
-        else
-            UpdateSolution_PLA!(SOLUTION_NEXT,GRIDS,par)
-        end
+        UpdateSolution!(HH_OBJ,SOLUTION_NEXT,GRIDS,par)
         dst_q, NotConvPct, Ix=ComputeDistance_q(SOLUTION_CURRENT,SOLUTION_NEXT,par)
         dst_D, dst_P, Iv, NotConvPct_P=ComputeDistanceV(SOLUTION_CURRENT,SOLUTION_NEXT,par)
         dst_V=max(dst_D,dst_P)
         cnt=cnt+1
         SOLUTION_CURRENT=deepcopy(SOLUTION_NEXT)
         if PrintProg
-            if PrintAll
-                println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-            else
-                if mod(cnt,100)==0
-                    println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-                end
-            end
+            println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
         end
     end
-    if PrintProg
-        println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-    end
-    return SOLUTION_NEXT
+
+    return Model(SOLUTION_NEXT,GRIDS,par)
 end
 
-function SolveClosed_VFI(PrintProg::Bool,PrintAll::Bool,GRIDS::Grids,par::Pars)
-    @unpack Tol_q, Tol_V, cnt_max = par
-    parClosed=Pars(par,θ=0.0,d0=0.0,d1=0.0)
+function SolveModel_VFI_Grim(PrintProg::Bool,GRIDS::Grids,par::Pars,par_No_Rule::Pars)
+    @unpack Tol_q, Tol_V, cnt_max, Decentralized, ForeignInvestors = par
     if PrintProg
         println("Preparing solution guess")
     end
-    SOLUTION_CURRENT=InitiateEmptySolution(GRIDS,parClosed)
-    SOLUTION_NEXT=deepcopy(SOLUTION_CURRENT)
-    dst_V=1.0
-    dst_D=1.0
-    dst_P=1.0
-    NotConvPct_P=1.0
-    dst_q=1.0
-    NotConvPct=100.0
-    cnt=0
-    if PrintProg
-        println("Starting VFI")
-    end
-    while cnt<cnt_max && (dst_V>Tol_V || dst_q>Tol_q)
-        UpdateSolution_Closed!(SOLUTION_NEXT,GRIDS,parClosed)
-        dst_q, NotConvPct, Ix=ComputeDistance_q(SOLUTION_CURRENT,SOLUTION_NEXT,parClosed)
-        dst_D, dst_P, Iv, NotConvPct_P=ComputeDistanceV(SOLUTION_CURRENT,SOLUTION_NEXT,parClosed)
-        dst_V=max(dst_D,dst_P)
-        cnt=cnt+1
-        SOLUTION_CURRENT=deepcopy(SOLUTION_NEXT)
-        if PrintProg
-            if PrintAll
-                println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-            else
-                if mod(cnt,100)==0
-                    println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-                end
-            end
-        end
-    end
-    if PrintProg
-        println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-    end
-    return Model(SOLUTION_NEXT,GRIDS,parClosed)
-end
-
-function SolveModel_VFI_GRIM(RuleAfterDefault::Bool,PrintProg::Bool,PrintAll::Bool,GRIDS::Grids,par::Pars,parFR::Pars)
-    @unpack Tol_q, Tol_V, cnt_max = par
-    if PrintProg
-        println("Preparing solution guess")
-    end
+    SOLUTION_NO_RULE=InitiateEmptySolution(GRIDS,par_No_Rule)
     SOLUTION_CURRENT=InitiateEmptySolution(GRIDS,par)
-    SOLUTION_CURRENT_FR=InitiateEmptySolution(GRIDS,parFR)
-
-    HH_OBJ=InitiateHH_Obj(SOLUTION_CURRENT,GRIDS,par)
-    HH_OBJ_FR=InitiateHH_Obj(SOLUTION_CURRENT_FR,GRIDS,parFR)
-
     SOLUTION_NEXT=deepcopy(SOLUTION_CURRENT)
-    SOLUTION_NEXT_FR=deepcopy(SOLUTION_CURRENT_FR)
-
-    dst_V=1.0
-    rdts_V=100.0
-    dst_q=1.0
-    NotConvPct=100.0
+    HH_OBJ_NO_RULE=InitiateHH_Obj(SOLUTION_NO_RULE,GRIDS,par_No_Rule)
+    HH_OBJ=InitiateHH_Obj(SOLUTION_CURRENT,GRIDS,par)
+    dst_V=1.0; dst_D=1.0; dst_P=1.0; NotConvPct_P=1.0; dst_q=1.0; NotConvPct=100.0
     cnt=0
     if PrintProg
         println("Starting VFI")
     end
     while cnt<cnt_max && (dst_V>Tol_V || dst_q>Tol_q)
-        #Update solutions, first no rule
-        UpdateSolution_DEC!(HH_OBJ,SOLUTION_NEXT,GRIDS,par)
-        UpdateSolution_GRIM!(RuleAfterDefault,HH_OBJ_FR,SOLUTION_NEXT_FR,SOLUTION_NEXT,GRIDS,parFR)
-
-        #Compute distances no rule
-        dst_q, NotConvPct=ComputeDistance_q(SOLUTION_CURRENT,SOLUTION_NEXT,par)
+        UpdateSolution!(HH_OBJ_NO_RULE,SOLUTION_NO_RULE,GRIDS,par_No_Rule)
+        UpdateSolution_Grim!(HH_OBJ,HH_OBJ_NO_RULE,SOLUTION_NEXT,SOLUTION_NO_RULE,GRIDS,par)
+        dst_q, NotConvPct, Ix=ComputeDistance_q(SOLUTION_CURRENT,SOLUTION_NEXT,par)
         dst_D, dst_P, Iv, NotConvPct_P=ComputeDistanceV(SOLUTION_CURRENT,SOLUTION_NEXT,par)
         dst_V=max(dst_D,dst_P)
-
-        #Compute distances fiscal rule
-        dst_qFR, NotConvPctFR=ComputeDistance_q(SOLUTION_CURRENT_FR,SOLUTION_NEXT_FR,parFR)
-        dst_DFR, dst_PFR, IvFR, NotConvPct_PFR=ComputeDistanceV(SOLUTION_CURRENT_FR,SOLUTION_NEXT_FR,parFR)
-        dst_VFR=max(dst_DFR,dst_PFR)
-
         cnt=cnt+1
         SOLUTION_CURRENT=deepcopy(SOLUTION_NEXT)
-        SOLUTION_CURRENT_FR=deepcopy(SOLUTION_NEXT_FR)
         if PrintProg
-            if PrintAll
-                println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-                println("          dsDFR=$dst_DFR, dsPFR=$dst_PFR at $IvFR, $NotConvPct_PFR% of V not converged, d_qFR=$dst_qFR")
-            else
-                if mod(cnt,100)==0
-                    println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
-                    println("          dsDFR=$dst_DFR, dsPFR=$dst_PFR at $IvFR, $NotConvPct_PFR% of V not converged, d_qFR=$dst_qFR")
-                end
-            end
+            println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
         end
     end
-    return SOLUTION_NEXT, SOLUTION_NEXT_FR
+
+    return Model(SOLUTION_NEXT,GRIDS,par), Model(SOLUTION_NO_RULE,GRIDS,par_No_Rule)
 end
 
-function SolveAndSaveModel(Decentralized::Bool,NAME::String,GRIDS::Grids,par::Pars)
+function Model_FromSetup(setup_coulumn::Int64,SETUP_FILE::String)
+    XX=readdlm(SETUP_FILE,',')
+    NAME=convert(String,XX[1,setup_coulumn])
+    VEC_PAR=XX[2:end,setup_coulumn]*1.0
+    par, GRIDS=Setup_From_Vector(VEC_PAR)
+
     PrintProg=true; PrintAll=true
-    SOL=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par)
-    SaveModel_Vector(NAME,SOL,par)
+    MOD=SolveModel_VFI(PrintProg,GRIDS,par)
+
+    return MOD, NAME
+end
+
+function Models_Welfare_Decomposition(FOLDER::String)
+    benchmark_coulumn=2
+    planner_column=3
+    covenants_column=6
+
+    MOD_Benchmark, xx, yy, zz=Unpack_All_Models_Case(benchmark_coulumn,FOLDER)
+    MOD_Planner, xx, yy, zz=Unpack_All_Models_Case(planner_column,FOLDER)
+    MOD_Covenants, xx, yy, zz=Unpack_All_Models_Case(covenants_column,FOLDER)
+
+    par_Efficient=Pars(MOD_Benchmark.par,Covenants=true,Decentralized=false)
+
+    PrintProg=true; PrintAll=true
+    MOD_Efficient=SolveModel_VFI(PrintProg,MOD_Benchmark.GRIDS,par_Efficient)
+
+    return MOD_Benchmark, MOD_Planner, MOD_Covenants, MOD_Efficient
+end
+
+function Save_Model_FromSetup(setup_coulumn::Int64,SETUP_FILE::String)
+    MOD, NAME=Model_FromSetup(setup_coulumn,SETUP_FILE)
+    SaveModel_Vector(NAME,MOD)
     return nothing
 end
 
-function SolveAndSaveModel_GRIM(RuleAfterDefault::Bool,NAME_FR::String,GRIDS::Grids,par::Pars,parFR::Pars)
-    PrintProg=true; PrintAll=true
-    SOL, SOL_FR=SolveModel_VFI_GRIM(RuleAfterDefault,PrintProg,PrintAll,GRIDS,par,parFR)
-    SaveModel_Vector(NAME_FR,SOL_FR,parFR)
-    return nothing
-end
+function Model_NoCommitment(Strict::Bool,Only_DL::Bool,setup_coulumn::Int64,SETUP_FILE::String)
+    SETUP_FILE="$FOLDER\\Setup.csv"
+    XX=readdlm(SETUP_FILE,',')
+    NAME_CASE=convert(String,XX[1,case_coulumn])
 
-function SolveAndSaveModel_GRIMfast(NAME::String,MOD0::Model,parFR::Pars)
+    MAT=readdlm("$FOLDER\\Models $NAME_CASE.csv",',')
+    MOD0=UnpackModel_Vector(MAT[:,1])
+    par_No_Rule=Pars(MOD0.par,Strict=Strict)
+    GRIDS=deepcopy(MOD0.GRIDS)
+    if Only_DL
+        MOD_DL=UnpackModel_Vector(MAT[:,2])
+        par=Pars(MOD_DL.par,Strict=Strict)
+    else
+        MOD_FRpair=UnpackModel_Vector(MAT[:,3])
+        par=Pars(MOD_FRpair.par,Strict=Strict)
+    end
+
     PrintProg=true; PrintAll=true
-    SOL_GRIM=SolveModel_VFI_GRIMfast(PrintProg,PrintAll,MOD0,parFR)
-    SaveModel_Vector(NAME,SOL_GRIM,parFR)
-    return nothing
+    MOD_GRIM, MOD_NO_RULE=SolveModel_VFI_Grim(PrintProg,GRIDS,par,par_No_Rule)
+
+    return MOD_GRIM, MOD_NO_RULE
 end
 
 ################################################################################
@@ -1794,17 +1959,21 @@ function Simulate_EndogenousVariables!(Def0::Float64,K0::Float64,B0::Float64,PAT
             # if PATHS.Readmission[t]<=par.θ
             if rand()<=par.θ
                 #Reentry
+                Default=false
+                x=State(Default,z,k,0.0)
                 PATHS.zP[t]=z
                 PATHS.B[t]=0.0
                 b=0.0
                 kprime=itp_kprime(b,k,z)
                 bprime=itp_bprime(b,k,z)
                 y=FinalOutput(z,k,par)
-                Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
+                Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
                 PATHS.Def[t]=0.0
                 PATHS.Spreads[t]=ComputeSpreads(z,kprime,bprime,SOLUTION,par)
             else
                 #Remain in default
+                Default=true
+                x=State(Default,z,k,0.0)
                 PATHS.zP[t]=zD
                 kprime=itp_kprime_D(k,z)
                 bprime=b
@@ -1817,6 +1986,8 @@ function Simulate_EndogenousVariables!(Def0::Float64,K0::Float64,B0::Float64,PAT
             #Coming from repayment, check if would default today
             if itp_VD(k,z)>itp_VP(b,k,z)
                 #Default
+                Default=true
+                x=State(Default,z,k,0.0)
                 PATHS.zP[t]=zD
                 kprime=itp_kprime_D(k,z)
                 bprime=b
@@ -1826,20 +1997,22 @@ function Simulate_EndogenousVariables!(Def0::Float64,K0::Float64,B0::Float64,PAT
                 PATHS.Spreads[t]=0.0
             else
                 #Repayment
+                Default=false
+                x=State(Default,z,k,b)
                 PATHS.zP[t]=z
                 kprime=itp_kprime(b,k,z)
                 bprime=itp_bprime(b,k,z)
                 y=FinalOutput(z,k,par)
-                Tr=Calculate_Tr(z,k,b,kprime,bprime,SOLUTION,par)
+                Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
                 PATHS.Def[t]=0.0
                 PATHS.Spreads[t]=ComputeSpreads(z,kprime,bprime,SOLUTION,par)
             end
         end
         PATHS.GDP[t]=y
-        PATHS.Cons[t]=ConsNet(y,k,kprime,Tr,par)
         PATHS.AdjCost[t]=CapitalAdjustment(kprime,k,par)
         PATHS.Inv[t]=kprime-(1-δ)*k+PATHS.AdjCost[t]
-        PATHS.TB[t]=-Tr
+        PATHS.Cons[t]=Evaluate_cons_state(x,kprime,Tr,par)
+        PATHS.TB[t]=PATHS.GDP[t]-PATHS.Cons[t]-PATHS.Inv[t]
         PATHS.CA[t]=-(bprime-b)
 
         Def_1=PATHS.Def[t]
@@ -1895,10 +2068,10 @@ function Simulate_Paths_Ergodic(T::Int64,MODEL::Model)
     @unpack SOLUTION, par = MODEL
     Random.seed!(1234)
 
-    Tlong=MOD.par.drp+T
+    Tlong=MODEL.par.drp+T
     PATHS_long=InitiateEmptyPaths(Tlong)
     PATHS=InitiateEmptyPaths(T)
-    t0=MOD.par.drp+1; t1=Tlong
+    t0=MODEL.par.drp+1; t1=Tlong
 
     Def0=0.0; z0=1.0; K0=0.5*(par.klow+par.khigh); B0=0.0
     Fill_Path_Simulation!(PATHS_long,Def0,z0,K0,B0,MODEL)
@@ -2044,6 +2217,47 @@ end
 ###############################################################################
 #Functions to calibrate capital adjustment cost
 ###############################################################################
+function SolveClosed_VFI(PrintProg::Bool,PrintAll::Bool,GRIDS::Grids,par::Pars)
+    @unpack Tol_q, Tol_V, cnt_max = par
+    parClosed=Pars(par,θ=0.0,d0=0.0,d1=0.0)
+    if PrintProg
+        println("Preparing solution guess")
+    end
+    SOLUTION_CURRENT=InitiateEmptySolution(GRIDS,parClosed)
+    SOLUTION_NEXT=deepcopy(SOLUTION_CURRENT)
+    dst_V=1.0
+    dst_D=1.0
+    dst_P=1.0
+    NotConvPct_P=1.0
+    dst_q=1.0
+    NotConvPct=100.0
+    cnt=0
+    if PrintProg
+        println("Starting VFI")
+    end
+    while cnt<cnt_max && (dst_V>Tol_V || dst_q>Tol_q)
+        UpdateSolution_Closed!(SOLUTION_NEXT,GRIDS,parClosed)
+        dst_q, NotConvPct, Ix=ComputeDistance_q(SOLUTION_CURRENT,SOLUTION_NEXT,parClosed)
+        dst_D, dst_P, Iv, NotConvPct_P=ComputeDistanceV(SOLUTION_CURRENT,SOLUTION_NEXT,parClosed)
+        dst_V=max(dst_D,dst_P)
+        cnt=cnt+1
+        SOLUTION_CURRENT=deepcopy(SOLUTION_NEXT)
+        if PrintProg
+            if PrintAll
+                println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
+            else
+                if mod(cnt,100)==0
+                    println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P at $Iv, $NotConvPct_P% of V not converged, dst_q=$dst_q")
+                end
+            end
+        end
+    end
+    if PrintProg
+        println("cnt=$cnt, dst_D=$dst_D, dst_P=$dst_P, $NotConvPct_P% of V not converged, dst_q=$dst_q")
+    end
+    return Model(SOLUTION_NEXT,GRIDS,parClosed)
+end
+
 function Evaluate_AdjCost(φtry::Float64,GRIDS::Grids,par::Pars)
     par_φ=Pars(par,φ=φtry)
     MOD_CLOSED=SolveClosed_VFI(false,false,GRIDS,par_φ)
@@ -2068,9 +2282,8 @@ end
 ###############################################################################
 function SolveCalibration_DEC(GRIDS::Grids,par::Pars)
     @unpack Tmom, NSamplesMoments = par
-    Decentralized=true; PrintProg=true; PrintAll=false
-    SOL=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par)
-    MOD=Model(SOL,GRIDS,par)
+    PrintProg=true
+    MOD=SolveModel_VFI(PrintProg,GRIDS,par)
     return AverageMomentsManySamples(Tmom,NSamplesMoments,MOD)
 end
 
@@ -2202,7 +2415,7 @@ function WelfareGains_Val(v0::Float64,v1::Float64,par::Pars)
     return 100*(((v1/v0)^(1/(1-σ)))-1)
 end
 
-function AverageWelfareGains(ZeroDebt::Bool,N::Int64,MOD0::Model,MOD1::Model)
+function AverageWelfareGains(N::Int64,MOD0::Model,MOD1::Model)
     @unpack par = MOD0
 
     Random.seed!(1234)
@@ -2216,487 +2429,406 @@ function AverageWelfareGains(ZeroDebt::Bool,N::Int64,MOD0::Model,MOD1::Model)
 
     wg=0.0
     for i in 1:N
-        z=PATHS.z[i]; k=PATHS.K[i]
-        if ZeroDebt
-            b=0.0
-        else
-            b=PATHS.B[i]
-        end
+        z=PATHS.z[i]; k=PATHS.K[i]; b=PATHS.B[i]
 
         v0p=MOD0.SOLUTION.itp_VP(b,k,z)
         v0d=MOD0.SOLUTION.itp_VD(k,z)
-        v0=max(v0p,v0d)
+        if v0d>v0p
+            #Government defaults
+            v0=MOD0.SOLUTION.itp_VDhh(k,z)
+        else
+            #Government repays
+            v0=MOD0.SOLUTION.itp_VPhh(b,k,z)
+        end
 
         v1p=MOD1.SOLUTION.itp_VP(b,k,z)
         v1d=MOD1.SOLUTION.itp_VD(k,z)
-        v1=max(v1p,v1d)
+        if v1d>v1p
+            #Government defaults
+            v1=MOD1.SOLUTION.itp_VDhh(k,z)
+        else
+            #Government repays
+            v1=MOD1.SOLUTION.itp_VPhh(b,k,z)
+        end
 
         wg=wg+WelfareGains_Val(v0,v1,par)/N
     end
     return wg
 end
 
-function WelfareGainsMatrixFine(N::Int64,zat_f::Float64,MOD0::Model,MOD1::Model)
+function AverageWelfareGains_0(N::Int64,MOD0::Model,MOD1::Model)
     @unpack par = MOD0
-    WG=Array{Float64,2}(undef,N,N)
-    kk=collect(range(par.klow,stop=par.khigh,length=N))
-    bb=collect(range(par.blow,stop=par.bhigh,length=N))
-    for I in CartesianIndices(WG)
-        (b_ind,k_ind)=Tuple(I)
-        k=kk[k_ind]; b=bb[b_ind]
-        v0=MOD0.SOLUTION.itp_V(b,k,zat_f)
-        v1=MOD1.SOLUTION.itp_V(b,k,zat_f)
-        WG[I]=WelfareGains_Val(v0,v1,par)
+
+    Random.seed!(1234)
+    PATHS_long=InitiateEmptyPaths(par.drp+N)
+    PATHS=InitiateEmptyPaths(N)
+
+    t0=par.drp+1; t1=par.drp+N
+    Def0=0.0; z0=1.0; K0=0.5*(par.klow+par.khigh); B0=0.0
+    Fill_Path_Simulation!(PATHS_long,Def0,z0,K0,B0,MOD0)
+    ExtractFromLongPaths!(t0,t1,PATHS,PATHS_long)
+
+    wg=0.0
+    for i in 1:N
+        z=PATHS.z[i]; k=PATHS.K[i]; b=0.0#PATHS.B[i]
+
+        v0p=MOD0.SOLUTION.itp_VP(b,k,z)
+        v0d=MOD0.SOLUTION.itp_VD(k,z)
+        if v0d>v0p
+            #Government defaults
+            v0=MOD0.SOLUTION.itp_VDhh(k,z)
+        else
+            #Government repays
+            v0=MOD0.SOLUTION.itp_VPhh(b,k,z)
+        end
+
+        v1p=MOD1.SOLUTION.itp_VP(b,k,z)
+        v1d=MOD1.SOLUTION.itp_VD(k,z)
+        if v1d>v1p
+            #Government defaults
+            v1=MOD1.SOLUTION.itp_VDhh(k,z)
+        else
+            #Government repays
+            v1=MOD1.SOLUTION.itp_VPhh(b,k,z)
+        end
+
+        wg=wg+WelfareGains_Val(v0,v1,par)/N
     end
-    return WG
+    return wg
 end
 
-function PlotWelfareGainsMatrix(N::Int64,zat_f::Float64,MOD_DEC::Model,MOD_DEC_FR::Model)
-    @unpack par = MOD_DEC
-    WGf=WelfareGainsMatrixFine(N,zat_f,MOD_DEC,MOD_DEC_FR)
-    kk=collect(range(par.klow,stop=par.khigh,length=N))
-    bb=collect(range(par.blow,stop=par.bhigh,length=N))
-    zrnd=round(zat_f,digits=2)
-    TITLE="Welfare gains, z=$zrnd"
-    plt=heatmap(kk,bb,WGf,c=:hot,title=TITLE,ylabel="B",xlabel="K")
-    foo(k::Float64)=parFR.FR*FinalOutput(zat_f,k,par)
-    plot!(kk,foo.(kk),ylims=[bb[1],bb[end]],label="debt limit B'<0.63*Y",
-          ylabel="B",xlabel="K",linecolor=:blue,legend=:bottomright)
+function WelfareGains_AvState(N::Int64,MOD_BEN::Model,MOD0::Model,MOD1::Model)
+    @unpack par = MOD_BEN
 
-    savefig(plt,"Graphs\\Heatmap_z_$zrnd.pdf")
-    return plt
-end
+    Random.seed!(1234)
+    PATHS_long=InitiateEmptyPaths(par.drp+N)
+    PATHS=InitiateEmptyPaths(N)
 
-function PlotWelfareGainsMatrixPositive(N::Int64,zat_f::Float64,MOD_DEC::Model,MOD_DEC_FR::Model)
-    WGf=WelfareGainsMatrixFine(N,zat_f,MOD_DEC,MOD_DEC_FR)
-    kk=collect(range(par.klow,stop=par.khigh,length=N))
-    bb=collect(range(par.blow,stop=par.bhigh,length=N))
-    TITLE="Positive gains from fiscal rule"
-    plt=heatmap(kk,bb,WGf .> 0,c=:hot,title=TITLE,ylabel="B",xlabel="K",legend=false)
-    foo(k::Float64)=parFR.FR*FinalOutput(zat_f,k,par)
-    plot!(kk,foo.(kk),ylims=[bb[1],bb[end]],label="debt limit",
-          ylabel="B",xlabel="K",linecolor=:blue)
+    t0=par.drp+1; t1=par.drp+N
+    Def0=0.0; z0=1.0; K0=0.5*(par.klow+par.khigh); B0=0.0
+    Fill_Path_Simulation!(PATHS_long,Def0,z0,K0,B0,MOD_BEN)
+    ExtractFromLongPaths!(t0,t1,PATHS,PATHS_long)
 
-    savefig(plt,"Graphs\\HeatmapPos_z_$zat_f.pdf")
-    return plt
+    z=mean(PATHS.z)
+    k=mean(PATHS.K)
+    b=mean(PATHS.B)
+
+    v0p=MOD0.SOLUTION.itp_VP(b,k,z)
+    v0d=MOD0.SOLUTION.itp_VD(k,z)
+    if v0d>v0p
+        #Government defaults
+        v0=MOD0.SOLUTION.itp_VDhh(k,z)
+    else
+        #Government repays
+        v0=MOD0.SOLUTION.itp_VPhh(b,k,z)
+    end
+
+    v1p=MOD1.SOLUTION.itp_VP(b,k,z)
+    v1d=MOD1.SOLUTION.itp_VD(k,z)
+    if v1d>v1p
+        #Government defaults
+        v1=MOD1.SOLUTION.itp_VDhh(k,z)
+    else
+        #Government repays
+        v1=MOD1.SOLUTION.itp_VPhh(b,k,z)
+    end
+
+    wg=WelfareGains_Val(v0,v1,par)
+    return wg
 end
 
 ###############################################################################
 #Functions to find optimal fiscal rule
 ###############################################################################
-function TestOneFiscalRule(IsPlanner::Bool,IsGrim::Bool,FR::Float64,Nwg::Int64,MOD0::Model)
+function TestOneDebtLimit(DL::Float64,MOD0::Model)
     @unpack par, GRIDS = MOD0
-    PrintProg=false; PrintAll=false
-    par_fr=Pars(par,WithFR=true,FR=FR)
-    if IsPlanner
-        #Testing fiscal rule in centralized economy with commitment
-        Decentralized=false
-        SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
-    else
-        Decentralized=true
-        if IsGrim
-            #Testing fiscal rule in decentralized economy with grim strategy
-            RuleAfterDefault=false
-            SOL0, SOL1=SolveModel_VFI_GRIM(RuleAfterDefault,PrintProg,PrintAll,GRIDS,par,par_fr)
-        else
-            #Testing fiscal rule in decentralized economy with commitment
-            SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
-        end
-    end
-    MOD1=Model(SOL1,GRIDS,par_fr)
-    ZeroDebt=false
-    wg=AverageWelfareGains(ZeroDebt,Nwg,MOD0,MOD1)
+    PrintProg=false
+    par_fr=Pars(par,WithFR=true,OnlyBudgetBalance=false,FR=DL)
+    MOD1=SolveModel_VFI(PrintProg,GRIDS,par_fr)
+
+    Nwg=10000
+    wg=AverageWelfareGains(Nwg,MOD0,MOD1)
     return wg, MOD1
 end
 
-function TestOneTransitionSmoother(IsPlanner::Bool,IsGrim::Bool,FR::Float64,χ::Float64,Nwg::Int64,MOD0::Model)
+function TestOneDeficitLimit(χ::Float64,MOD0::Model)
     @unpack par, GRIDS = MOD0
-    PrintProg=false; PrintAll=false
-    par_fr=Pars(par,WithFR=true,FR=FR,χ=χ)
-    if IsPlanner
-        #Testing fiscal rule in centralized economy with commitment
-        Decentralized=false
-        SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
-    else
-        Decentralized=true
-        if IsGrim
-            #Testing fiscal rule in decentralized economy with grim strategy
-            RuleAfterDefault=false
-            SOL0, SOL1=SolveModel_VFI_GRIM(RuleAfterDefault,PrintProg,PrintAll,GRIDS,par,par_fr)
-        else
-            #Testing fiscal rule in decentralized economy with commitment
-            SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
-        end
-    end
-    MOD1=Model(SOL1,GRIDS,par_fr)
-    ZeroDebt=false
-    wg=AverageWelfareGains(ZeroDebt,Nwg,MOD0,MOD1)
+    PrintProg=false
+    par_fr=Pars(par,WithFR=true,OnlyBudgetBalance=true,χ=χ)
+    MOD1=SolveModel_VFI(PrintProg,GRIDS,par_fr)
+
+    Nwg=10000
+    wg=AverageWelfareGains(Nwg,MOD0,MOD1)
     return wg, MOD1
 end
 
-function TestManyFiscalRules_Dec(grFR::Vector,MOD0_DEC::Model)
-    IsPlanner=false; IsGrim=false
+function Save_wg_dl(IsFirst::Bool,NAME_CASE::String,MAT_WG::SharedArray{Float64,2})
+    (N_dl, cols)=size(MAT_WG)
+    grDL=MAT_WG[:,1]
+    wg_vec=MAT_WG[:,2]
+    def_pr_vec=MAT_WG[:,3]
+    VEC=vcat(NAME_CASE,N_dl)
+    VEC=vcat(VEC,grDL)
+    VEC=vcat(VEC,wg_vec)
+    VEC=vcat(VEC,def_pr_vec)
+
+    GAINS_FLE="WelfareGains_DL.csv"
+    if IsFirst
+        writedlm(GAINS_FLE,VEC,',')
+    else
+        XX=readdlm(GAINS_FLE,',')
+        MAT=hcat(XX,VEC)
+        writedlm(GAINS_FLE,MAT,',')
+    end
+
+    return nothing
+end
+
+function Save_wg_defl(IsFirst::Bool,NAME_CASE::String,MAT_WG::SharedArray{Float64,2})
+    (N_dl, cols)=size(MAT_WG)
+    grDL=MAT_WG[:,1]
+    wg_vec=MAT_WG[:,2]
+    def_pr_vec=MAT_WG[:,3]
+    VEC=vcat(NAME_CASE,N_dl)
+    VEC=vcat(VEC,grDL)
+    VEC=vcat(VEC,wg_vec)
+    VEC=vcat(VEC,def_pr_vec)
+
+    GAINS_FLE="WelfareGains_DefL.csv"
+    if IsFirst
+        writedlm(GAINS_FLE,VEC,',')
+    else
+        XX=readdlm(GAINS_FLE,',')
+        MAT=hcat(XX,VEC)
+        writedlm(GAINS_FLE,MAT,',')
+    end
+
+    return nothing
+end
+
+function FindBestDebtLimit(grDL::Vector,MOD0::Model)
+    MOD1=deepcopy(MOD0)
+
     #Allocate matrices to fill
-    N=length(grFR); Nwg=10000
-    MAT_WG=SharedArray{Float64,2}(N,2)
-    VEC=Create_Model_Vector(MOD0_DEC.SOLUTION,MOD0_DEC.par)
+    N_dl=length(grDL)
+    #MAT_WG has columns: [debt_limit welfare_gains default_Pr]
+    MAT_WG=SharedArray{Float64,2}(N_dl,3)
 
-    SOLS_DEC=SharedArray{Float64,2}(length(VEC),N)
-    @sync @distributed for i_fr in 1:N
-        println("Doing decentralized, i=$i_fr of $N")
-        #Do decentralized with commitment
-        MAT_WG[i_fr,1]=grFR[i_fr]
-        MAT_WG[i_fr,2], MOD1=TestOneFiscalRule(IsPlanner,IsGrim,grFR[i_fr],Nwg,MOD0_DEC)
-        SOLS_DEC[:,i_fr]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
+    VEC=Create_Model_Vector(MOD0)
+    N_size_model=length(VEC)
+    ALL_SOLS_DL=SharedArray{Float64,2}(N_size_model,N_dl)
+    @sync @distributed for i_dl in 1:N_dl
+        println("Trying debt limit, i=$i_dl of $N_dl")
+        MAT_WG[i_dl,1]=grDL[i_dl]
+        MAT_WG[i_dl,2], MOD1=TestOneDebtLimit(grDL[i_dl],MOD0)
+        MOM1=AverageMomentsManySamples(MOD1.par.Tmom,MOD1.par.NSamplesMoments,MOD1)
+        MAT_WG[i_dl,3]=MOM1.DefaultPr
+        ALL_SOLS_DL[:,i_dl]=Create_Model_Vector(MOD1)
     end
+
+    #Find model with best debt limit
+    wg_vec=MAT_WG[:,2]
+    wg, i_best=findmax(wg_vec)
+    VEC_BEST=ALL_SOLS_DL[:,i_best]
+
+    return UnpackModel_Vector(VEC_BEST), MAT_WG
+end
+
+function FindBestDeficitRule(grχ::Vector,MOD0::Model)
+    MOD1=deepcopy(MOD0)
+
+    #Allocate matrices to fill
+    N_dl=length(grχ)
+    #MAT_WG has columns: [debt_limit welfare_gains default_Pr]
+    MAT_WG=SharedArray{Float64,2}(N_dl,3)
+
+    VEC=Create_Model_Vector(MOD0)
+    N_size_model=length(VEC)
+    ALL_SOLS_DL=SharedArray{Float64,2}(N_size_model,N_dl)
+    @sync @distributed for i_dl in 1:N_dl
+        println("Trying deficit limit, i=$i_dl of $N_dl")
+        MAT_WG[i_dl,1]=grχ[i_dl]
+        MAT_WG[i_dl,2], MOD1=TestOneDeficitLimit(grχ[i_dl],MOD0)
+        MOM1=AverageMomentsManySamples(MOD1.par.Tmom,MOD1.par.NSamplesMoments,MOD1)
+        MAT_WG[i_dl,3]=MOM1.DefaultPr
+        ALL_SOLS_DL[:,i_dl]=Create_Model_Vector(MOD1)
+    end
+
+    #Find model with best debt limit
+    wg_vec=MAT_WG[:,2]
+    wg, i_best=findmax(wg_vec)
+    VEC_BEST=ALL_SOLS_DL[:,i_best]
+
+    return UnpackModel_Vector(VEC_BEST), MAT_WG
+end
+
+function TestOnePair_DL_χ(χ::Float64,DL::Float64,MOD0::Model)
+    @unpack par, GRIDS = MOD0
+    PrintProg=false
+    par_fr=Pars(par,WithFR=true,OnlyBudgetBalance=false,FR=DL,χ=χ)
+    MOD1=SolveModel_VFI(PrintProg,GRIDS,par_fr)
+
+    Nwg=10000
+    wg=AverageWelfareGains(Nwg,MOD0,MOD1)
+    return wg, MOD1
+end
+
+function Save_wg_pair(NAME_CASE::String,grχ::Vector,grDL::Vector,MAT_WG::SharedArray{Float64,2})
+    N_χ=length(grχ)
+    N_dl=length(grDL)
+    wg_vec=reshape(MAT_WG,(:))
+    VEC=vcat(N_χ,N_dl)
+    VEC=vcat(VEC,grχ)
+    VEC=vcat(VEC,grDL)
+    VEC=vcat(VEC,wg_vec)
+
+    writedlm("WelfareGains_Pairs_$NAME_CASE.csv",VEC,',')
+    return nothing
+end
+
+function TestManyPairs_DL_χ(grχ::Vector,grDL::Vector,MOD0::Model)
+    MOD1=deepcopy(MOD0)
+
+    #Allocate matrices to fill
+    N_χ=length(grχ)
+    N_dl=length(grDL)
+    MAT_WG=SharedArray{Float64,2}(N_dl,N_χ)
+
+    VEC=Create_Model_Vector(MOD0)
+    N_size_model=length(VEC)
+    ALL_SOLS_FR=SharedArray{Float64,3}(N_dl,N_χ,N_size_model)
+    @sync @distributed for I in CartesianIndices(MAT_WG)
+        (i_dl,i_χ)=Tuple(I)
+        println("Trying pair, i_dl=$i_dl, i_χ=$i_χ")
+        MAT_WG[I], MOD1=TestOnePair_DL_χ(grχ[i_χ],grDL[i_dl],MOD0)
+        ALL_SOLS_FR[i_dl,i_χ,:]=Create_Model_Vector(MOD1)
+    end
+
+    #Save model with best fiscal rule with adjustment
+    wg, I_best=findmax(MAT_WG)
+    VEC_BEST=ALL_SOLS_FR[I_best,:]
+
+    return UnpackModel_Vector(VEC_BEST), MAT_WG
+end
+
+function Grids_to_Try_FromFile(setup_coulumn::Int64)
+    SETUP_FILE="Setup_FR_grids.csv"
+    XX=readdlm(SETUP_FILE,',')
+    VEC=1.0*XX[2:end,setup_coulumn]
+
+    dl_low=VEC[1]
+    dl_high=VEC[2]
+    χ_low=VEC[3]
+    χ_high=VEC[4]
+    N_DL=convert(Int64,VEC[5])
+    N_χ=convert(Int64,VEC[6])
+
+    grDL=collect(range(dl_low,stop=dl_high,length=N_DL))
+    grχ=collect(range(χ_low,stop=χ_high,length=N_χ))
+
+    return grDL, grχ
+end
+
+function TestAll_DebtLimits_And_FiscalRules(DoPairs::Bool,IsFirst::Bool,setup_coulumn::Int64,SETUP_FILE::String)
+    grDL, grχ=Grids_to_Try_FromFile(setup_coulumn)
+
+    MOD0, NAME_CASE=Model_FromSetup(setup_coulumn,SETUP_FILE)
+    MOD_DL, MAT_WG_DL=FindBestDebtLimit(grDL,MOD0)
+    if DoPairs
+        MOD_FRpair, MAT_WG_FRpair=TestManyPairs_DL_χ(grχ,grDL,MOD0)
+    end
+    MOD_DefL, MAT_WG_DefL=FindBestDeficitRule(grχ,MOD0)
+
+    #Save models
+    VEC0=Create_Model_Vector(MOD0)
+    VEC_DL=Create_Model_Vector(MOD_DL)
+    MAT=hcat(VEC0,VEC_DL)
+    VEC_DefL=Create_Model_Vector(MOD_DefL)
+    MAT=hcat(MAT,VEC_DefL)
+    if DoPairs
+        VEC_FRpair=Create_Model_Vector(MOD_FRpair)
+        MAT=hcat(MAT,VEC_FRpair)
+    end
+    writedlm("Models $NAME_CASE.csv",MAT,',')
 
     #Save matrices of tried rules and their welfare gains
-    NAMES=["FR" "DEC"]
-    MAT=vcat(NAMES,MAT_WG)
-    writedlm("WelfareGains_DEC.csv",MAT,',')
-
-    #Save matrices with all solutions
-    writedlm("ALL_SOLS_DEC_FR_0.csv",SOLS_DEC,',')
-
-    wg, i_fr_best=findmax(MAT_WG[:,2])
-
-    return grFR[i_fr_best]
-end
-
-function TestManyTransitionSmoothers_Dec(FR::Float64,grχ::Vector,MOD0_DEC::Model)
-    IsPlanner=false; IsGrim=false
-    #Allocate matrices to fill
-    N=length(grχ); Nwg=10000
-    MAT_WG=SharedArray{Float64,2}(N,2)
-    VEC=Create_Model_Vector(MOD0_DEC.SOLUTION,MOD0_DEC.par)
-
-    SOLS_DEC=SharedArray{Float64,2}(length(VEC),N)
-    #Span to N*2 workers
-    @sync @distributed for i_χ in 1:N
-        println("Doing smoother, iχ=$i_χ of $N, FR=$FR")
-        #Do decentralized with commitment
-        MAT_WG[i_χ,1]=grχ[i_χ]
-        MAT_WG[i_χ,2], MOD1=TestOneTransitionSmoother(IsPlanner,IsGrim,FR,grχ[i_χ],Nwg,MOD0_DEC)
-        SOLS_DEC[:,i_χ]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
+    Save_wg_dl(IsFirst,NAME_CASE,MAT_WG_DL)
+    Save_wg_defl(IsFirst,NAME_CASE,MAT_WG_DefL)
+    if DoPairs
+        Save_wg_pair(NAME_CASE,grχ,grDL,MAT_WG_FRpair)
     end
-
-    #Save matrices of tried rules and their welfare gains
-    NAMES=["chi" "DEC"]
-    MAT=vcat(NAMES,MAT_WG)
-    writedlm("WelfareGainsTransition_DEC.csv",MAT,',')
-
-    #Save matrices with all solutions
-    writedlm("ALL_SOLS_DEC_FR_CHI.csv",SOLS_DEC,',')
 
     return nothing
 end
 
-function StackSolutions_PairsOfPolicies(MAT_SOLS::Array{Float64,3})
-    (N_FR, N_χ, Lsol)=size(MAT_SOLS)
-    VEC_SOLS=reshape(MAT_SOLS,(:))
-    VEC=vcat(N_FR,N_χ)
-    VEC=vcat(VEC,Lsol)
-    VEC=vcat(VEC,VEC_SOLS)
-    return VEC
+###############################################################################
+#Compute transfers to avoid deviations
+###############################################################################
+function Optimizer_One_Shot_Deviation(x::State,SOLUTION::Solution,GRIDS::Grids,par::Pars)
+    @unpack GR_z, GR_k, GR_b = GRIDS
+    #Only makes sense in repayment
+    #Do bprime unconstrained by the fiscal rule, just this one time
+    kprime=SOLUTION.itp_kprime(x.b,x.k,x.z)
+    blowOpt, bhighOpt=Search_bprime_unconstrained(x,kprime,SOLUTION,GRIDS,par)
+
+    foo(bprime::Float64)=-Evaluate_ValueFunction(false,x,kprime,bprime,SOLUTION,par)
+    res=optimize(foo,blowOpt,bhighOpt,GoldenSection())
+
+    bprime=Optim.minimizer(res)
+    Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+    cons=Evaluate_cons_state(x,kprime,Tr,par)
+    return -Optim.minimum(res), kprime, bprime, cons
 end
 
-function UnpackArrayOfSolutions(VEC)
-    N_FR=convert(Int64,VEC[1])
-    N_χ=convert(Int64,VEC[2])
-    Lsol=convert(Int64,VEC[3])
-    Ix=(N_FR,N_χ,Lsol)
+function Avoid_One_Shot_Deviation(x::State,MODEL::Model)
+    @unpack SOLUTION, GRIDS, par = MODEL
+    v_dev, kprime_dev, bprime_dev, c_dev=Optimizer_One_Shot_Deviation(x,SOLUTION,GRIDS,par)
 
-    ARR=reshape(VEC[4:end],Ix)
-    return ARR
+    @unpack itp_VP, itp_kprime, itp_bprime = SOLUTION
+    v_no_dev=itp_VP(x.b,x.k,x.z)
+    kprime=itp_kprime(x.b,x.k,x.z)
+    bprime=itp_bprime(x.b,x.k,x.z)
+    Tr=Calculate_Tr(x,kprime,bprime,SOLUTION,par)
+    c_no_dev=Evaluate_cons_state(x,kprime,Tr,par)
+
+    @unpack σ = par
+    τ=((((1-σ)*(Utility(c_no_dev,par)+(v_dev-v_no_dev)))^(1/(1-σ)))/c_no_dev)-1
+    return τ, v_dev, v_no_dev, c_dev, c_no_dev
 end
 
-function TestOneFiscalRulePair(IsPlanner::Bool,IsGrim::Bool,FR::Float64,χ::Float64,Nwg::Int64,MOD0::Model)
-    @unpack par, GRIDS = MOD0
-    PrintProg=false; PrintAll=false
-    par_fr=Pars(par,WithFR=true,FR=FR,χ=χ)
-    if IsPlanner
-        #Testing fiscal rule in centralized economy with commitment
-        Decentralized=false
-        SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
-    else
-        Decentralized=true
-        if IsGrim
-            #Testing fiscal rule in decentralized economy with grim strategy
-            RuleAfterDefault=false
-            SOL0, SOL1=SolveModel_VFI_GRIM(RuleAfterDefault,PrintProg,PrintAll,GRIDS,par,par_fr)
+function Time_Series_Transfers_to_avoid_deviation(TS::Paths,MODEL::Model)
+    T=length(TS.z)
+    TAU=Array{Float64,1}(undef,T)
+    V_DEV=Array{Float64,1}(undef,T)
+    V_NO_DEV=Array{Float64,1}(undef,T)
+    C_DEV=Array{Float64,1}(undef,T)
+    C_NO_DEV=Array{Float64,1}(undef,T)
+    for t in 1:T
+        if TS.Def[t]==0.0
+            x=State(false,TS.z[t],TS.K[t],TS.B[t])
+            τ, v_dev, v_no_dev, c_dev, c_no_dev=Avoid_One_Shot_Deviation(x,MODEL)
+            TAU[t]=τ
+            V_DEV[t]=v_dev
+            V_NO_DEV[t]=v_no_dev
+            C_DEV[t]=c_dev
+            C_NO_DEV[t]=c_no_dev
         else
-            #Testing fiscal rule in decentralized economy with commitment
-            SOL1=SolveModel_VFI(Decentralized,PrintProg,PrintAll,GRIDS,par_fr)
+            TAU[t]=0.0
         end
     end
-    MOD1=Model(SOL1,GRIDS,par_fr)
-    wg=AverageWelfareGains(false,Nwg,MOD0,MOD1)
-    return wg, MOD1
+    return TAU, V_DEV, V_NO_DEV, C_DEV, C_NO_DEV
 end
 
-function TestManyFiscalRulePairs(IsPlanner::Bool,IsGrim::Bool,grFR::Vector,grχ::Vector,MOD0::Model)
-    #Allocate arrays to fill
-    #Total computations will be N_FR*N_χ
-    N_FR=length(grFR); N_χ=length(grχ); Nwg=10000
-    N=N_FR*N_χ
-
-    ARR_WG=SharedArray{Float64,2}(N_FR,N_χ)
-
-    VEC_MOD=Create_Model_Vector(MOD0.SOLUTION,MOD0.par)
-    SOLS=SharedArray{Float64,3}(N_FR,N_χ,length(VEC_MOD))
-
-    #Span to N workers
-    @sync @distributed for I in CartesianIndices(ARR_WG)
-        (i_fr,i_χ)=Tuple(I)
-        ARR_WG[i_fr,i_χ], MOD1=TestOneFiscalRulePair(IsPlanner,IsGrim,grFR[i_fr],grχ[i_χ],Nwg,MOD0)
-        SOLS[i_fr,i_χ,:]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
-        if IsPlanner
-            println("Done with planner i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-        else
-            if IsGrim
-                println("Done with grim i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-            else
-                println("Done with decentralized i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-            end
-        end
-    end
-
-    #Create vector with all info of welfare gains
-    VEC=vcat(N_FR,N_χ)
-    VEC=vcat(VEC,grFR[1])
-    VEC=vcat(VEC,grFR[end])
-    VEC=vcat(VEC,grχ[1])
-    VEC=vcat(VEC,grχ[end])
-    VEC_WG=reshape(ARR_WG,(:))
-    VEC=vcat(VEC,VEC_WG)
-
-    #Pick model with best fiscal rule
-    wg, I_best=findmax(ARR_WG)
-    (iFR_best,iχ_best)=Tuple(I_best)
-    FR=grFR[iFR_best]; χ=grχ[iχ_best]
-
-    if IsPlanner
-        writedlm("TriedRules_PLA.csv",VEC,',')
-        NAME_SOLS="ALL_SOLS_PLA_FR.csv"
-    else
-        if IsGrim
-            writedlm("TriedRules_GRIM.csv",VEC,',')
-            NAME_SOLS="ALL_SOLS_GRIM_FR.csv"
-        else
-            writedlm("TriedRules_DEC.csv",VEC,',')
-            NAME_SOLS="ALL_SOLS_DEC_FR.csv"
-        end
-    end
-
-    MAT_SOLS=convert(Array{Float64,3},SOLS)
-    VEC_SOLS=StackSolutions_PairsOfPolicies(MAT_SOLS)
-    writedlm(NAME_SOLS,VEC_SOLS,',')
-
-    return FR, χ
-end
-
-function Map_T_to_χ(FR::Float64,T::Float64,MOD::Model)
-    @unpack par = MOD
-    TT=par.drp+par.Tmom
-    PATHS_long=InitiateEmptyPaths(TT)
-    PATHS=InitiateEmptyPaths(par.Tmom)
-    t0=par.drp+1; t1=TT
-
-    Def0=0.0; z0=1.0; K0=0.5*(par.klow+par.khigh); B0=0.0
-    Fill_Path_Simulation!(PATHS_long,Def0,z0,K0,B0,MOD)
-    ExtractFromLongPaths!(t0,t1,PATHS,PATHS_long)
-
-    bbar=mean(PATHS.B)
-    AvGDP=4*mean(PATHS.GDP)
-    Fbar=FR*AvGDP
-
-    #Assume T is expressed in years
-    Tquarters=4*T
-
-    return 1-((Fbar/bbar)^Tquarters)
-end
-
-function TestManyFiscalRulePairsT(IsPlanner::Bool,IsGrim::Bool,grFR::Vector,grT::Vector,MOD0::Model)
-    #Allocate arrays to fill
-    #Total computations will be N_FR*N_χ
-    N_FR=length(grFR); N_T=length(grT); Nwg=10000
-    N=N_FR*N_T
-
-    ARR_WG=SharedArray{Float64,2}(N_FR,N_T)
-
-    VEC_MOD=Create_Model_Vector(MOD0.SOLUTION,MOD0.par)
-    SOLS=SharedArray{Float64,3}(N_FR,N_T,length(VEC_MOD))
-
-    #Span to N workers
-    @sync @distributed for I in CartesianIndices(ARR_WG)
-        (i_fr,i_T)=Tuple(I)
-        FR=grFR[i_fr]; T=grT[i_T]
-        χ=Map_T_to_χ(FR,T,MOD0)
-        ARR_WG[i_fr,i_T], MOD1=TestOneFiscalRulePair(IsPlanner,IsGrim,FR,χ,Nwg,MOD0)
-        SOLS[i_fr,i_T,:]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
-        println("Done with i_fr=$i_fr of $N_FR, i_T=$i_T of $N_T")
-    end
-
-    #Create vector with all info of welfare gains
-    VEC=vcat(N_FR,N_T)
-    VEC=vcat(VEC,grFR[1])
-    VEC=vcat(VEC,grFR[end])
-    VEC=vcat(VEC,grT[1])
-    VEC=vcat(VEC,grT[end])
-    VEC_WG=reshape(ARR_WG,(:))
-    VEC=vcat(VEC,VEC_WG)
-
-    if IsPlanner
-        writedlm("TriedRules_PLA.csv",VEC,',')
-        NAME="SOL_PLA_FR"
-    else
-        if IsGrim
-            writedlm("TriedRules_GRIM.csv",VEC,',')
-            NAME="SOL_GRIM"
-        else
-            writedlm("TriedRules_DEC.csv",VEC,',')
-            NAME="SOL_DEC_FR"
-        end
-    end
-
-    #Save models with best fiscal rule for each T
-    MAT_BEST=Array{Float64,2}(undef,length(grT),4)
-    for t in 1:length(grT)
-        T=grT[t]
-        wg, iFR_best=findmax(ARR_WG[:,t])
-        FR=grFR[iFR_best]
-        χ=Map_T_to_χ(FR,T,MOD0)
-        MAT_BEST[t,1]=T
-        MAT_BEST[t,2]=FR
-        MAT_BEST[t,3]=wg
-        MAT_BEST[t,4]=χ
-        MOD1=UnpackModel_Vector(SOLS[iFR_best,t,:])
-        NAME_t="$NAME$t.csv"
-        SaveModel_Vector(NAME_t,MOD1.SOLUTION,MOD1.par)
-        println("Best FR for T=$T is FR=$FR with wg=$wg")
-    end
-    COL_NAMES=["T" "FR" "wg" "chi"]
-    writedlm("BestRules_T.csv",vcat(COL_NAMES,MAT_BEST),',')
-
-    return nothing
-end
-
-function TestManyFiscalRulesPairs_All(grFR::Vector,grχ::Vector,MOD0_DEC::Model,MOD0_PLA::Model)
-    #Allocate arrays to fill
-    #Total computations will be N_FR*N_χ
-    N_FR=length(grFR); N_χ=length(grχ); Nwg=10000
-    N=N_FR*N_χ
-
-    ARR_WG=SharedArray{Float64,3}(N_FR,N_χ,3) #Third dimension is DEC, GRIM, PLA
-
-    VEC_DEC=Create_Model_Vector(MOD0_DEC.SOLUTION,MOD0_DEC.par)
-    SOLS_DEC=SharedArray{Float64,3}(N_FR,N_χ,length(VEC_DEC))
-    SOLS_GRIM=SharedArray{Float64,3}(N_FR,N_χ,length(VEC_DEC))
-    SOLS_PLA=SharedArray{Float64,3}(N_FR,N_χ,length(VEC_DEC))
-
-    #Span to N workers (do PLA with all workers first because it's faster)
-    IsPlanner=true; IsGrim=false
-    @sync @distributed for I in CartesianIndices(ARR_WG[:,:,3])
-        (i_fr,i_χ)=Tuple(I)
-        ARR_WG[i_fr,i_χ,3], MOD1=TestOneFiscalRulePair(IsPlanner,IsGrim,grFR[i_fr],grχ[i_χ],Nwg,MOD0_PLA)
-        SOLS_PLA[i_fr,i_χ,:]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
-        println("Planner: done with i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-    end
-
-    #Span to N*2 workers (now do DEC and GRIM, which are slower)
-    IsPlanner=false
-    @sync @distributed for I in CartesianIndices(ARR_WG[:,:,1:2])
-        (i_fr,i_χ,i_case)=Tuple(I)
-        if i_case==1
-            #Do decentralized with commitment
-            IsGrim=false
-            ARR_WG[I], MOD1=TestOneFiscalRulePair(IsPlanner,IsGrim,grFR[i_fr],grχ[i_χ],Nwg,MOD0_DEC)
-            SOLS_DEC[i_fr,i_χ,:]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
-            println("Decentralized: done with i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-        else
-            #Do decentralized with grim strategy
-            IsGrim=true
-            ARR_WG[I], MOD1=TestOneFiscalRulePair(IsPlanner,IsGrim,grFR[i_fr],grχ[i_χ],Nwg,MOD0_DEC)
-            SOLS_GRIM[i_fr,i_χ,:]=Create_Model_Vector(MOD1.SOLUTION,MOD1.par)
-            println("Grim: done with i_fr=$i_fr of $N_FR, i_χ=$i_χ of $N_χ")
-        end
-    end
-    #Save vector with all info of welfare gains
-    VEC=vcat(N_FR,N_χ)
-    VEC=vcat(VEC,grFR[1])
-    VEC=vcat(VEC,grFR[end])
-    VEC=vcat(VEC,grχ[1])
-    VEC=vcat(VEC,grχ[end])
-    VEC_WG=reshape(ARR_WG,(:))
-    VEC=vcat(VEC,VEC_WG)
-    writedlm("TriedRules_All.csv",VEC,',')
-
-    #Save models with best fiscal rules
-    wg_DEC, I_best_DEC=findmax(ARR_WG[:,:,1])
-    wg_GRIM, I_best_GRIM=findmax(ARR_WG[:,:,2])
-    wg_PLA, I_best_PLA=findmax(ARR_WG[:,:,3])
-
-    (iFR_best_DEC,iχ_best_DEC)=Tuple(I_best_DEC)
-    (iFR_best_GRIM,iχ_best_GRIM)=Tuple(I_best_GRIM)
-    (iFR_best_PLA,iχ_best_PLA)=Tuple(I_best_PLA)
-
-    FR_DEC=grFR[iFR_best_DEC]; χ_DEC=grχ[iχ_best_DEC]
-    FR_GRIM=grFR[iFR_best_GRIM]; χ_GRIM=grχ[iχ_best_GRIM]
-    FR_PLA=grFR[iFR_best_PLA]; χ_PLA=grχ[iχ_best_PLA]
-
-    NAME="SOL_DEC_FR.csv"
-    MOD1=UnpackModel_Vector(SOLS_DEC[iFR_best_DEC,iχ_best_DEC,:])
-    SaveModel_Vector(NAME,MOD1.SOLUTION,MOD1.par)
-
-    NAME="SOL_GRIM.csv"
-    MOD1=UnpackModel_Vector(SOLS_GRIM[iFR_best_GRIM,iχ_best_GRIM,:])
-    SaveModel_Vector(NAME,MOD1.SOLUTION,MOD1.par)
-
-    NAME="SOL_PLA_FR.csv"
-    MOD1=UnpackModel_Vector(SOLS_PLA[iFR_best_PLA,iχ_best_PLA,:])
-    SaveModel_Vector(NAME,MOD1.SOLUTION,MOD1.par)
-
-    println("Best FR for decentralized is FR=$FR_DEC, χ=$χ_DEC with wg=$wg_DEC")
-    println("Best FR for planner is FR=$FR_PLA, χ=$χ_PLA with wg=$wg_PLA")
-    println("Best FR for grim is FR=$FR_GRIM, χ=$χ_GRIM with wg=$wg_GRIM")
-
-    return nothing
-end
-
-function UnpackWelfareGains(FOLDER_FILE::String)
-    VEC=readdlm(FOLDER_FILE,',')
-
-    N_FR=convert(Int64,VEC[1])
-    N_χ=convert(Int64,VEC[2])
-    fr_low=convert(Float64,VEC[3])
-    fr_high=convert(Float64,VEC[4])
-    χ_low=convert(Float64,VEC[5])
-    χ_high=convert(Float64,VEC[6])
-
-    gr_fr=collect(range(fr_low,stop=fr_high,length=N_FR))
-    gr_χ=collect(range(χ_low,stop=χ_high,length=N_χ))
-
-    ARR=reshape(1*VEC[7:end,1],(N_FR,N_χ,3))
-
-    return ARR, gr_fr, gr_χ
-end
-
-function UnpackWelfareGainsT(FOLDER_FILE::String)
-    VEC=readdlm(FOLDER_FILE,',')
-
-    N_FR=convert(Int64,VEC[1])
-    N_T=convert(Int64,VEC[2])
-    fr_low=convert(Float64,VEC[3])
-    fr_high=convert(Float64,VEC[4])
-    T_low=convert(Float64,VEC[5])
-    T_high=convert(Float64,VEC[6])
-
-    gr_fr=collect(range(fr_low,stop=fr_high,length=N_FR))
-    gr_T=collect(range(T_low,stop=T_high,length=N_T))
-
-    ARR=reshape(1*VEC[7:end,1],(N_FR,N_T))
-
-    return ARR, gr_fr, gr_T
+function Moments_Deviation_Transfers(MOD_DL::Model)
+    T=10000
+    TS_rule=Simulate_Paths_Ergodic(T,MOD_DL)
+    TAU, V_DEV, V_NO_DEV, C_DEV, C_NO_DEV=Time_Series_Transfers_to_avoid_deviation(TS_rule,MOD_DL)
+    av_τ=mean(100*TAU)
+    std_τ=std(100*TAU)
+    cor_τ_GDP=cor(TS_rule.GDP,TAU)
+    cor_τ_Spreads=cor(TS_rule.Spreads,TAU)
+    percentage_positive=100*sum(TAU .> 0.0)/T
+    av_τ, std_τ, cor_τ_GDP, cor_τ_Spreads, percentage_positive
 end
 
 ###############################################################################
