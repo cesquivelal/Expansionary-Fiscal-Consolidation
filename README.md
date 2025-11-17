@@ -1,4 +1,4 @@
-# Expansionary-Fiscal-Rules
+# Expansionary Fiscal Rules
 
 Replication code for "Expansionary Fiscal Rules Under Sovereign Risk" by Carlos Esquivel and Agustín Sámano
 
