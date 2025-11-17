@@ -1,6 +1,6 @@
-# Expansionary-Fiscal-Consolidation
+# Expansionary-Fiscal-Rules
 
-Replication code for "Expansionary Fiscal Consolidation Under Sovereign Risk" by Carlos Esquivel and Agustín Sámano
+Replication code for "Expansionary Fiscal Rules Under Sovereign Risk" by Carlos Esquivel and Agustín Sámano
 
 August, 2025:
 https://cesquivelal.github.io/ES_ExFisCon.pdf
